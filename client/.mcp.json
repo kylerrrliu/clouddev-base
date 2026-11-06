@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "clouddev-base": {
+      "type": "http",
+      "url": "https://your-b-machine.your-tailnet.ts.net/mcp",
+      "timeout": 330000
+    }
+  }
+}
