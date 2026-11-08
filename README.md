@@ -158,33 +158,6 @@ https://你的隧道域名/mcp
 
 > cloudflared 的临时隧道（`trycloudflare.com`）每次重启地址都会变，需要用新地址重启服务并重新添加连接器。长期使用建议用固定域名：Cloudflare 命名隧道、ngrok 固定域名或 Tailscale Funnel。
 
-## 用法三：本机 stdio（Claude Code、Claude 桌面版本地配置）
-
-AI 客户端和项目在同一台电脑上时，不需要隧道和密码，由客户端直接启动进程。
-
-Claude Code：
-
-```bash
-claude mcp add --scope user clouddev-base -- clouddev-base stdio --root ~/work
-```
-
-`--scope user` 让它在任何目录下启动的 Claude Code 里都可用。不加的话默认是 local 作用域，只在运行这条命令的目录里生效。
-
-Claude 桌面版：编辑 `claude_desktop_config.json`（设置 → 开发者 → 编辑配置），写绝对路径（图形界面程序通常拿不到终端里的 PATH，`which node` 可以查到 node 的路径）：
-
-```json
-{
-  "mcpServers": {
-    "clouddev-base": {
-      "command": "/usr/local/bin/node",
-      "args": ["/path/to/clouddev-base/dist/cli.js", "stdio", "--root", "/Users/你/work"]
-    }
-  }
-}
-```
-
-要从另一台电脑上的 Claude Code 连接，见用法一。
-
 ## 配置文件
 
 都在 `~/.clouddev-base/` 下（可用环境变量 `CLOUDDEV_BASE_HOME` 改位置），权限为 `600`：
@@ -226,7 +199,7 @@ npm run build
 
 ```text
 src/
-  cli.ts            命令行：init / serve / stdio / password
+  cli.ts            命令行：init / serve / password
   config.ts         配置与 Owner 密码
   http.ts           HTTP 服务：OAuth 端点 + /mcp（无状态 Streamable HTTP，5 分钟 keep-alive，
                     跨请求的取消，鉴权后才解析请求体）

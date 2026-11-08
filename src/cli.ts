@@ -3,7 +3,6 @@ import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   configPath,
   ensureOwnerPassword,
@@ -17,7 +16,6 @@ import {
   type ConfigOverrides,
 } from "./config.ts";
 import { configureHttpServer, createHttpApp } from "./http.ts";
-import { createMcpServer } from "./mcp.ts";
 import { expandHome } from "./paths.ts";
 import { VERSION } from "./version.ts";
 import { WorkspaceRegistry } from "./workspaces.ts";
@@ -28,9 +26,7 @@ const HELP = `clouddev-base ${VERSION} — 让 Claude 等 AI 通过 MCP 读写�
   clouddev-base init --root <目录> [--root <目录>] [--public-url <https 地址>] [--port <端口>]
       保存配置并生成 Owner 密码（只需运行一次）
   clouddev-base serve [--root <目录>] [--public-url <https 地址>] [--port <端口>] [--host <地址>]
-      启动 HTTP MCP 服务（供 claude.ai / Claude 桌面版的自定义连接器通过隧道连接）
-  clouddev-base stdio [--root <目录>]
-      以 stdio 方式运行（供 Claude Code、Claude 桌面版本地配置直接启动）
+      启动 HTTP MCP 服务，供其他电脑上的 Claude Code（经 Tailscale）或 claude.ai / Claude 桌面版（经公网隧道）连接
   clouddev-base password [--reset]
       显示 Owner 密码；加 --reset 生成新密码，运行中的服务立即生效
 
@@ -68,8 +64,6 @@ async function main(argv: string[]): Promise<void> {
       return init(overrides, values.reset ?? false);
     case "serve":
       return serve(overrides);
-    case "stdio":
-      return stdio(overrides);
     case "password":
       return password(values.reset ?? false);
     case "help":
@@ -111,9 +105,7 @@ ${isLocalUrl(config.publicUrl) ? accessSetupSteps(config.port) : `下一步:
        clouddev-base serve
   2. 客户端连接地址: ${new URL("/mcp", config.publicUrl).href}
        另一台电脑上的 Claude Code: 填进 client/.mcp.json，在 client/ 目录里运行 claude，再用 /mcp 认证
-       claude.ai: 在 设置 → 连接器 里添加自定义连接器`}
-
-只在本机使用（Claude Code / Claude 桌面版本地配置）时，不需要这些，用 clouddev-base stdio 即可。`);
+       claude.ai: 在 设置 → 连接器 里添加自定义连接器`}`);
 }
 
 function accessSetupSteps(port: number): string {
@@ -176,15 +168,6 @@ ${missingRootsWarning(config.allowedRoots)}${local ? `
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
   });
-}
-
-async function stdio(overrides: ConfigOverrides): Promise<void> {
-  const config = loadConfig(overrides);
-  const registry = new WorkspaceRegistry(config.allowedRoots, config.homeDir);
-  const server = createMcpServer(registry);
-
-  await server.connect(new StdioServerTransport());
-  console.error(`clouddev-base ${VERSION} (stdio) 允许的目录: ${config.allowedRoots.join(", ")}`);
 }
 
 function password(reset: boolean): void {
