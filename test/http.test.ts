@@ -41,7 +41,7 @@ before(async () => {
     host: "127.0.0.1",
     port: 0,
     publicUrl: base,
-    allowedRedirectHosts: ["claude.ai"],
+    allowedRedirectHosts: ["example.com"],
   };
 
   const { app } = createHttpApp({ config, registry: new WorkspaceRegistry([projectRoot]) });
@@ -251,7 +251,7 @@ test("/mcp rejects requests without a valid token and points to the metadata", a
 
 test("client registration only accepts known redirect hosts", async () => {
   assert.equal((await registerClient("https://evil.example/callback")).status, 400);
-  assert.equal((await registerClient("https://claude.ai/api/mcp/auth_callback")).status, 201);
+  assert.equal((await registerClient("https://example.com/callback")).status, 201);
   assert.equal((await registerClient()).status, 201);
 });
 

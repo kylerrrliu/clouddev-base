@@ -1,6 +1,6 @@
 # clouddev-base
 
-一个精简的 MCP 服务器：让 Claude（claude.ai、Claude 桌面版、Claude Code）或其他支持 MCP 的 AI，直接打开你电脑上的项目，**读写、搜索代码，执行终端命令**。
+一个精简的 MCP 服务器：让一台电脑上的 Claude Code（或其他支持 MCP 的客户端）通过 Tailscale 直接打开另一台电脑上的项目，**读写、搜索代码，执行终端命令**。
 
 ## 提供给 AI 的工具
 
@@ -35,7 +35,7 @@ npm link           # 可选：把 clouddev-base 命令装到全局
 
 不想 `npm link` 的话，下文的 `clouddev-base` 都可以换成 `node /path/to/clouddev-base/dist/cli.js`。
 
-## 用法一：在电脑 A 上用 Claude Code 操作另一台电脑 B（Tailscale）
+## 用法：在电脑 A 上用 Claude Code 操作另一台电脑 B（Tailscale）
 
 B 上运行 clouddev-base，A 上的 Claude Code 通过 [Tailscale](https://tailscale.com) 私有网络连接它。Tailscale 只让你自己的设备访问 B，地址固定不变，也不需要公网隧道和自己的域名。
 
@@ -114,50 +114,6 @@ cd /path/to/client && claude
 
 > B 加入你的 tailnet 后，也能访问你 tailnet 里的其他设备，包括 A。介意的话，在 Tailscale 管理后台的 Access Controls 里只允许 A 访问 B。
 
-## 用法二：在 claude.ai / Claude 桌面版 / 手机上远程连接
-
-claude.ai 的服务器不在你的 tailnet 里，必须能从公网访问到你的电脑，所以这里要用一条公网 HTTPS 隧道。
-
-**1. 初始化**（只需一次）：指定允许 AI 访问的目录，并生成 Owner 密码
-
-```bash
-clouddev-base init --root ~/work
-```
-
-`--root` 可以写多次。目录尽量给得窄一些，比如 `~/work`，不要给 `~` 或 `/`。
-
-**2. 建立隧道**（任选一种，指向本机 7676 端口）
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:7676
-```
-
-```bash
-ngrok http 7676
-```
-
-记下它给出的 `https://...` 地址。
-
-**3. 用隧道地址启动服务**
-
-```bash
-clouddev-base serve --public-url https://你的隧道域名
-```
-
-`--public-url` 也可以在 `init` 时写进配置，以后直接 `clouddev-base serve`。
-
-**4. 在 Claude 里添加连接器**
-
-在 claude.ai 的 设置 → 连接器（Connectors）里添加自定义连接器，地址填：
-
-```text
-https://你的隧道域名/mcp
-```
-
-连接时会打开一个授权页，输入 Owner 密码（`clouddev-base password` 可以查看）即可。之后在对话里直接说“打开 ~/work/my-app，帮我跑一下测试并修复失败的用例”之类的话就行。
-
-> cloudflared 的临时隧道（`trycloudflare.com`）每次重启地址都会变，需要用新地址重启服务并重新添加连接器。长期使用建议用固定域名：Cloudflare 命名隧道、ngrok 固定域名或 Tailscale Funnel。
-
 ## 配置文件
 
 都在 `~/.clouddev-base/` 下（可用环境变量 `CLOUDDEV_BASE_HOME` 改位置），权限为 `600`：
@@ -171,23 +127,23 @@ https://你的隧道域名/mcp
 
 **Owner 密码。** 保存在 `auth.json`，至少 16 个字符。也可以用环境变量 `CLOUDDEV_BASE_PASSWORD` 提供，它优先于文件；设为空值等于没设。服务每次授权时都重新读取。这个环境变量不会传给 `bash` 执行的命令，但这只是防止意外泄露：`bash` 不是沙箱，命令仍能读到 `auth.json`。
 
-**`allowedRedirectHosts`。** 决定哪些客户端能注册授权：客户端的回调地址必须是 `https://`，且主机名在这个列表里；本机回环地址（`localhost`、`127.0.0.1`、`[::1]`）总是允许。默认列表是 `claude.ai`、`claude.com`、`chatgpt.com`。要接入其他 MCP 客户端，就编辑 `config.json`，把它回调地址的主机名加进去（没有对应的命令行参数），改完重启服务。注意这个字段会**替换**默认列表而不是追加，要把默认的三个一起写上，例如 `["claude.ai", "claude.com", "chatgpt.com", "example.com"]`；只写新域名的话，以后在 claude.ai 上就添加不了连接器了。
+**`allowedRedirectHosts`。** 决定哪些客户端能注册授权。回调地址在本机回环地址（`localhost`、`127.0.0.1`、`[::1]`）上的客户端总是允许，Claude Code 就属于这种，所以默认列表是空的。要接入回调地址是 `https://` 网址的其他 MCP 客户端，就编辑 `config.json`，把回调地址的主机名加进去，例如 `["example.com"]`（没有对应的命令行参数），改完重启服务。
 
 ## 安全须知
 
 - 连上的 AI 等同于一个能操作你电脑的协作者。文件工具被限制在工作区内，但 **`bash` 不是沙箱**，命令以你的用户权限运行。
 - 每个新客户端都必须在授权页输入 Owner 密码才能拿到令牌。密码不要外泄；授权页会显示授权后跳转的域名，只批准你自己发起的连接。
 - 要让所有已连接的客户端失效：停止服务，删除 `~/.clouddev-base/oauth.json`，再重新启动。`clouddev-base password --reset` 生成新密码，运行中的服务立即生效、不用重启，但它不会注销已连接的客户端。
-- 用 `tailscale serve` 时，服务只在你的 tailnet 内可见。用公网隧道时，隧道地址本身不是秘密，挡住别人靠的是 Owner 密码和授权令牌。不要在隧道前再加 Cloudflare Access 这类需要登录的验证：claude.ai 的请求从 Anthropic 的服务器发出，过不了这种登录，连接器会连不上。
+- 用 `tailscale serve` 时，服务只在你的 tailnet 内可见。不要用 `tailscale funnel`、cloudflared、ngrok 之类的工具把它开放到公网，那样挡住别人的就只剩 Owner 密码和授权令牌了。
 - 服务端终端会逐行打印每次工具调用（工具名、文件路径或搜索模式、耗时），方便你随时看 AI 在做什么。命令里可能带密钥，所以 `bash` 默认只记录命令长度；想看到完整命令，启动前设置环境变量 `CLOUDDEV_BASE_LOG_COMMANDS=1`。
 
 ## 排错
 
-- **先确认服务和隧道是通的。** 在 B 上运行 `curl http://127.0.0.1:7676/healthz`，再从 A（用法一）或任意联网的电脑（用法二）运行 `curl https://你的地址/healthz`，都应该返回 `{"ok":true,"name":"clouddev-base"}`。本机通、远程不通，问题出在 Tailscale 或隧道上。
-- **返回 403 `Invalid Host`**：请求里的域名和 `--public-url`（或配置里的 `publicUrl`）不一致，比如忘了设 `--public-url`，或者隧道地址变了。用实际的 https 地址重新启动服务。
-- **启动时提示端口已被占用**：用 `--port` 换一个端口，同时让 `tailscale serve` 或隧道指向新端口。
+- **先确认服务和 Tailscale 是通的。** 在 B 上运行 `curl http://127.0.0.1:7676/healthz`，再从 A 运行 `curl https://你的地址/healthz`，都应该返回 `{"ok":true,"name":"clouddev-base"}`。本机通、远程不通，问题出在 Tailscale 上。
+- **返回 403 `Invalid Host`**：请求里的域名和 `--public-url`（或配置里的 `publicUrl`）不一致，比如忘了设 `--public-url`，或者 B 在 Tailscale 里的名字变了。用实际的 https 地址重新启动服务。
+- **启动时提示端口已被占用**：用 `--port` 换一个端口，同时让 `tailscale serve` 指向新端口。
 - **授权页一直提示密码不正确**：如果服务启动时设置了 `CLOUDDEV_BASE_PASSWORD`，以这个环境变量为准；在没设这个变量的终端里运行 `clouddev-base password`，看到的是 `auth.json` 里的密码。
-- **新客户端连接时注册失败**：claude.ai、claude.com、chatgpt.com 和本机地址以外的客户端，要先把它回调地址的主机名加进 `allowedRedirectHosts`（见“配置文件”）。
+- **新客户端连接时注册失败**：回调地址不在本机回环地址上的客户端，要先把它回调地址的主机名加进 `allowedRedirectHosts`（见“配置文件”）。
 
 ## 开发
 
@@ -217,7 +173,7 @@ src/
   tools/git-index.ts      读取 .git/index（已跟踪的文件即使匹配忽略规则也会列出，与 git 一致）
   tools/glob-match.ts     不回溯的 glob 匹配
   tools/shell.ts    bash（不把服务自己的密钥传给命令）
-client/             在电脑 A 上启动 Claude Code 用的目录（见用法一）
+client/             在电脑 A 上启动 Claude Code 用的目录（见“用法”）
   .claude/settings.json
   .mcp.json
   CLAUDE.md

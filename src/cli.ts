@@ -26,7 +26,7 @@ const HELP = `clouddev-base ${VERSION} — 让 Claude 等 AI 通过 MCP 读写�
   clouddev-base init --root <目录> [--root <目录>] [--public-url <https 地址>] [--port <端口>]
       保存配置并生成 Owner 密码（只需运行一次）
   clouddev-base serve [--root <目录>] [--public-url <https 地址>] [--port <端口>] [--host <地址>]
-      启动 HTTP MCP 服务，供其他电脑上的 Claude Code（经 Tailscale）或 claude.ai / Claude 桌面版（经公网隧道）连接
+      启动 HTTP MCP 服务，供其他电脑上的 Claude Code 经 Tailscale 连接
   clouddev-base password [--reset]
       显示 Owner 密码；加 --reset 生成新密码，运行中的服务立即生效
 
@@ -104,20 +104,15 @@ ${isLocalUrl(config.publicUrl) ? accessSetupSteps(config.port) : `下一步:
   1. 启动服务:
        clouddev-base serve
   2. 客户端连接地址: ${new URL("/mcp", config.publicUrl).href}
-       另一台电脑上的 Claude Code: 填进 client/.mcp.json，在 client/ 目录里运行 claude，再用 /mcp 认证
-       claude.ai: 在 设置 → 连接器 里添加自定义连接器`}`);
+       填进另一台电脑上的 client/.mcp.json，在 client/ 目录里运行 claude，再用 /mcp 认证`}`);
 }
 
 function accessSetupSteps(port: number): string {
-  return `下一步，任选一种方式让客户端访问这台电脑:
-  A. 另一台电脑上的 Claude Code（推荐 Tailscale，只在你的私有网络内可见）:
+  return `下一步，用 Tailscale 让另一台电脑上的 Claude Code 连接这台电脑（只在你的私有网络内可见）:
+  1. 提供 HTTPS 并启动服务:
        tailscale serve --bg ${port}
        clouddev-base serve --public-url https://<本机名>.<tailnet>.ts.net
-     然后在那台电脑上用项目里的 client/ 目录启动 Claude Code（见 README 用法一）。
-  B. claude.ai 网页 / 桌面版 / 手机（需要公网 HTTPS 隧道）:
-       cloudflared tunnel --url http://127.0.0.1:${port}   （或 ngrok http ${port}）
-       clouddev-base serve --public-url https://<隧道域名>
-     然后在 Claude 的 设置 → 连接器 里添加 https://<隧道域名>/mcp`;
+  2. 在另一台电脑上用项目里的 client/ 目录启动 Claude Code（见 README 的“用法”）`;
 }
 
 function isLocalUrl(url: string): boolean {
@@ -152,9 +147,8 @@ function serve(overrides: ConfigOverrides): Promise<void> {
   允许的目录:  ${config.allowedRoots.join(", ")}
   Owner 密码:  运行 clouddev-base password 查看
 ${missingRootsWarning(config.allowedRoots)}${local ? `
-提示: 当前没有配置访问地址，其他电脑和 claude.ai 都连不上这台电脑。
-      Tailscale: 先运行 tailscale serve --bg ${config.port}，再加 --public-url https://<本机名>.<tailnet>.ts.net 重新启动
-      公网隧道:  用 cloudflared 或 ngrok 建立隧道后，加 --public-url https://<隧道域名> 重新启动
+提示: 当前没有配置访问地址，其他电脑连不上这台电脑。
+      先运行 tailscale serve --bg ${config.port}，再加 --public-url https://<本机名>.<tailnet>.ts.net 重新启动
 ` : ""}
 按 Ctrl+C 停止。工具调用会显示在下面:`);
     });

@@ -14,10 +14,9 @@ import type { WorkspaceRegistry } from "./workspaces.ts";
 const MAX_MCP_BODY = "20mb";
 
 /**
- * How long an idle connection stays open. Reverse proxies (Tailscale serve,
- * cloudflared, ngrok) keep pooled connections to us for about 90 s; with
- * Node's 5 s default a proxy can reuse one just as Node closes it, and that
- * request fails.
+ * How long an idle connection stays open. A reverse proxy such as Tailscale
+ * serve keeps pooled connections to us for about 90 s; with Node's 5 s
+ * default it can reuse one just as Node closes it, and that request fails.
  */
 export const KEEP_ALIVE_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -48,7 +47,7 @@ export function createHttpApp({ config, registry }: HttpAppOptions) {
   const app = express();
   app.disable("x-powered-by");
 
-  // Tunnels connect from loopback and pass the real client IP in X-Forwarded-For.
+  // A reverse proxy on this machine (tailscale serve) connects from loopback; trust the client IP it forwards.
   app.set("trust proxy", "loopback");
 
   // Host header allowlist (DNS-rebinding protection): loopback plus the public hostname.

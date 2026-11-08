@@ -7,9 +7,6 @@ import { expandHome } from "./paths.ts";
 export const DEFAULT_PORT = 7676;
 export const DEFAULT_HOST = "127.0.0.1";
 
-/** OAuth redirect hosts accepted during dynamic client registration (loopback is always allowed). */
-export const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com", "chatgpt.com"];
-
 /** What lives in ~/.clouddev-base/config.json. Every field is optional. */
 export interface StoredConfig {
   allowedRoots?: string[];
@@ -24,8 +21,9 @@ export interface Config {
   allowedRoots: string[];
   host: string;
   port: number;
-  /** Origin the MCP host uses to reach this server, e.g. https://my-tunnel.example.com */
+  /** Origin the MCP host uses to reach this server, e.g. https://b-mac.tail1234.ts.net */
   publicUrl: string;
+  /** Extra https hosts accepted as OAuth redirect targets. Loopback, which is all Claude Code uses, is always accepted. */
   allowedRedirectHosts: string[];
 }
 
@@ -73,7 +71,7 @@ export function loadConfig(overrides: ConfigOverrides = {}, env: NodeJS.ProcessE
     host,
     port,
     publicUrl,
-    allowedRedirectHosts: stored.allowedRedirectHosts ?? DEFAULT_REDIRECT_HOSTS,
+    allowedRedirectHosts: stored.allowedRedirectHosts ?? [],
   };
 }
 
@@ -84,13 +82,13 @@ export function normalizePublicUrl(value: string): string {
   try {
     url = new URL(value);
   } catch {
-    throw new Error(`无效的公网地址: ${value}`);
+    throw new Error(`无效的访问地址: ${value}`);
   }
 
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
 
   if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
-    throw new Error(`公网地址必须是 https://（本机调试可用 http://127.0.0.1）: ${value}`);
+    throw new Error(`访问地址必须是 https://（本机调试可用 http://127.0.0.1）: ${value}`);
   }
 
   return url.origin;
