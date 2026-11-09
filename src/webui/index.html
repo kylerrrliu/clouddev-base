@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>clouddev-base 活动</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M9 11l6 5-6 5M17 22h7' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>clouddev-base</h1>
+      <span class="tagline">Claude Code 在这台电脑上的操作</span>
+    </div>
+    <div id="connection" class="pill pill-wait" role="status">正在连接…</div>
+  </header>
+
+  <main class="layout">
+    <div class="primary">
+      <section class="panel" aria-labelledby="running-title">
+        <div class="panel-head">
+          <h2 id="running-title">进行中</h2>
+          <span id="running-count" class="count">0</span>
+        </div>
+        <div id="running" class="running"></div>
+        <p id="running-empty" class="empty">现在没有正在执行的操作。</p>
+      </section>
+
+      <section class="panel" aria-labelledby="history-title">
+        <div class="panel-head">
+          <h2 id="history-title">记录</h2>
+          <span id="history-count" class="count">0</span>
+          <div class="filters">
+            <select id="filter-tool" aria-label="按工具筛选">
+              <option value="">全部工具</option>
+            </select>
+            <label class="check"><input id="filter-errors" type="checkbox"> 只看出错</label>
+            <input id="filter-text" type="search" placeholder="搜索路径、命令…" aria-label="搜索">
+          </div>
+        </div>
+        <div id="history" class="history"></div>
+        <p id="history-empty" class="empty">还没有记录。Claude Code 连接后，它在这台电脑上的每一步都会实时出现在这里。</p>
+      </section>
+    </div>
+
+    <aside class="secondary">
+      <section class="panel" aria-labelledby="overview-title">
+        <div class="panel-head"><h2 id="overview-title">概况</h2></div>
+        <dl class="overview">
+          <dt>客户端</dt>
+          <dd id="client">还没有客户端连接</dd>
+          <dt>最近请求</dt>
+          <dd><span id="last-request">—</span>
+            <span class="hint">Claude Code 空闲时隧道里没有流量，这里看不出隧道是否连着；隧道状态在 A 上用 client/tunnel/status.sh 查看。</span>
+          </dd>
+          <dt>服务运行</dt>
+          <dd id="uptime">—</dd>
+          <dt>MCP 地址</dt>
+          <dd id="mcp-url" class="mono">—</dd>
+          <dt>允许的目录</dt>
+          <dd id="roots" class="mono">—</dd>
+        </dl>
+      </section>
+
+      <section class="panel" aria-labelledby="notices-title">
+        <div class="panel-head"><h2 id="notices-title">事件</h2></div>
+        <ul id="notices" class="notices"></ul>
+        <p id="notices-empty" class="empty">暂无事件。客户端连接、授权成功或密码输错时会记在这里。</p>
+      </section>
+    </aside>
+  </main>
+</body>
+</html>

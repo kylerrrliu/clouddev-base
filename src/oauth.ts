@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Response } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
@@ -47,6 +48,14 @@ export interface OwnerOAuthOptions {
   stateDir: string;
   /** Hosts allowed in redirect_uris during client registration. Loopback hosts are always allowed. */
   allowedRedirectHosts: string[];
+  /** Told about every submitted approval form, for the activity page. */
+  onAuthorization?: (event: AuthorizationEvent) => void;
+}
+
+export interface AuthorizationEvent {
+  outcome: "approved" | "wrong_password" | "no_password";
+  /** The name the client registered with. */
+  clientName: string;
 }
 
 /**
@@ -58,7 +67,9 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
   private readonly options: OwnerOAuthOptions;
   private readonly file: string;
-  private readonly data: StoreData;
+  private data: StoreData;
+  /** oauth.json exists with our data, so its disappearance means someone deleted it. */
+  private onDisk: boolean;
   private readonly codes = new Map<string, PendingCode>();
 
   constructor(options: OwnerOAuthOptions) {
@@ -67,9 +78,10 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
     this.data = readJson<StoreData>(this.file) ?? { clients: {}, tokens: {} };
     this.data.clients ??= {};
     this.data.tokens ??= {};
+    this.onDisk = existsSync(this.file);
 
     this.clientsStore = {
-      getClient: (clientId) => this.data.clients[clientId],
+      getClient: (clientId) => this.store().clients[clientId],
       registerClient: (metadata) => this.registerClient({
         client_id: randomUUID(),
         client_id_issued_at: Math.floor(Date.now() / 1000),
@@ -85,16 +97,50 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
       }
     }
 
-    this.data.clients[client.client_id] = client;
+    const store = this.store();
+    store.clients[client.client_id] = client;
 
-    // Registration is unauthenticated; keep the file from growing without bound.
-    const ids = Object.keys(this.data.clients);
+    // Registration is unauthenticated; keep the file from growing without bound. The oldest clients go first,
+    // but never one that still holds a valid token: a flood of registrations must not sign out the owner's client.
+    const ids = Object.keys(store.clients);
+    let excess = ids.length - MAX_CLIENTS;
 
-    for (const id of ids.slice(0, Math.max(0, ids.length - MAX_CLIENTS))) delete this.data.clients[id];
+    if (excess > 0) {
+      const signedIn = new Set(Object.values(store.tokens).filter((record) => !isExpired(record)).map((record) => record.clientId));
+
+      for (const id of ids) {
+        if (excess === 0) break;
+        if (id === client.client_id || signedIn.has(id)) continue;
+
+        delete store.clients[id];
+        excess--;
+      }
+    }
 
     this.save();
 
     return client;
+  }
+
+  /** The name a client registered with, for display. */
+  clientName(clientId: string): string | undefined {
+    return this.store().clients[clientId]?.client_name;
+  }
+
+  /**
+   * The clients and tokens in effect. Deleting oauth.json signs every client out at once, without a restart
+   * (stopping the background service does not work anyway: launchd starts it again within a second): the copy
+   * in memory is dropped instead of being written back on the next save.
+   */
+  private store(): StoreData {
+    if (this.onDisk && !existsSync(this.file)) {
+      this.data = { clients: {}, tokens: {} };
+      this.codes.clear();
+      this.onDisk = false;
+      console.error(`${this.file} 已被删除：所有客户端和令牌都已失效，客户端要重新授权。`);
+    }
+
+    return this.data;
   }
 
   private redirectAllowed(uri: string): boolean {
@@ -125,6 +171,7 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
     const ownerPassword = this.currentOwnerPassword();
 
     if (!ownerPassword) {
+      this.reportAuthorization("no_password", client);
       res.status(503).type("html").send(approvalPage(client, params, "服务器上没有可用的 Owner 密码。请在运行 clouddev-base 的电脑上执行 clouddev-base password，然后重试。"));
 
       return;
@@ -133,6 +180,7 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
     const password = String(res.req.body?.owner_password ?? "");
 
     if (!safeEqual(password, ownerPassword)) {
+      this.reportAuthorization("wrong_password", client);
       res.status(401).type("html").send(approvalPage(client, params, "密码不正确。"));
 
       return;
@@ -150,7 +198,16 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
 
     if (params.state !== undefined) redirect.searchParams.set("state", params.state);
 
+    this.reportAuthorization("approved", client);
     res.redirect(302, redirect.href);
+  }
+
+  private reportAuthorization(outcome: AuthorizationEvent["outcome"], client: OAuthClientInformationFull): void {
+    try {
+      this.options.onAuthorization?.({ outcome, clientName: client.client_name ?? client.client_id });
+    } catch (error) {
+      console.error("Authorization listener failed:", error);
+    }
   }
 
   /** Read fresh each time. If it cannot be read (broken auth.json, too-short env value), approval is refused. */
@@ -195,7 +252,8 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
     resource?: URL,
   ): Promise<OAuthTokens> {
     const key = hashToken(refreshToken);
-    const record = this.data.tokens[key];
+    const tokens = this.store().tokens;
+    const record = tokens[key];
 
     if (!record || record.kind !== "refresh" || record.clientId !== client.client_id || isExpired(record)) {
       throw new InvalidGrantError("Invalid refresh token");
@@ -206,13 +264,13 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
     }
 
     // Refresh tokens are single use: rotate on every refresh.
-    delete this.data.tokens[key];
+    delete tokens[key];
 
     return this.issueTokens(client.client_id);
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const record = this.data.tokens[hashToken(token)];
+    const record = this.store().tokens[hashToken(token)];
 
     if (!record || record.kind !== "access" || isExpired(record)) {
       throw new InvalidTokenError("Invalid or expired access token");
@@ -228,7 +286,7 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
   }
 
   async revokeToken(_client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
-    delete this.data.tokens[hashToken(request.token)];
+    delete this.store().tokens[hashToken(request.token)];
     this.save();
   }
 
@@ -247,9 +305,10 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
     const accessToken = randomBytes(32).toString("base64url");
     const refreshToken = randomBytes(32).toString("base64url");
     const resource = this.options.resourceUrl.href;
+    const tokens = this.store().tokens;
 
-    this.data.tokens[hashToken(accessToken)] = { kind: "access", clientId, expiresAt: now + ACCESS_TOKEN_TTL_SECONDS, resource };
-    this.data.tokens[hashToken(refreshToken)] = { kind: "refresh", clientId, expiresAt: now + REFRESH_TOKEN_TTL_SECONDS, resource };
+    tokens[hashToken(accessToken)] = { kind: "access", clientId, expiresAt: now + ACCESS_TOKEN_TTL_SECONDS, resource };
+    tokens[hashToken(refreshToken)] = { kind: "refresh", clientId, expiresAt: now + REFRESH_TOKEN_TTL_SECONDS, resource };
     this.save();
 
     return {
@@ -262,11 +321,14 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
   }
 
   private save(): void {
-    for (const [key, record] of Object.entries(this.data.tokens)) {
-      if (isExpired(record)) delete this.data.tokens[key];
+    const store = this.store();
+
+    for (const [key, record] of Object.entries(store.tokens)) {
+      if (isExpired(record)) delete store.tokens[key];
     }
 
-    writeJsonPrivate(this.file, this.data);
+    writeJsonPrivate(this.file, store);
+    this.onDisk = true;
   }
 }
 

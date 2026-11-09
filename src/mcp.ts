@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
+import type { ActivityLog } from "./activity.ts";
 import { textResult, type ToolResult } from "./tools/common.ts";
 import { editPath, listDirectory, readPath, writePath } from "./tools/files.ts";
 import { glob, grep } from "./tools/search.ts";
@@ -25,6 +26,10 @@ export interface McpServerOptions {
   logCommands?: boolean;
   /** Interval for progress notifications while a bash command runs. */
   progressIntervalMs?: number;
+  /** Where tool calls are reported for the local activity page. */
+  activity?: ActivityLog;
+  /** Display name of an OAuth client, for the activity page. */
+  clientName?: (clientId: string) => string | undefined;
 }
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
@@ -34,6 +39,44 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
   const roots = registry.allowedRoots.join(", ");
   const logCommands = options.logCommands ?? process.env.CLOUDDEV_BASE_LOG_COMMANDS === "1";
   const progressIntervalMs = options.progressIntervalMs ?? PROGRESS_INTERVAL_MS;
+  const { activity } = options;
+
+  /**
+   * Run a tool: turn exceptions into error results, report the call to the activity page,
+   * and log one line per call to stderr. `logDetail` is what the log shows; the activity page,
+   * which keeps everything in memory on this computer, always gets the full `summary`.
+   */
+  const run = async (
+    call: { tool: string; summary: string; logDetail?: string; args: Record<string, unknown>; extra: ToolExtra },
+    operation: (onOutput?: (text: string) => void) => Promise<ToolResult>,
+  ): Promise<ToolResult> => {
+    const startedAt = performance.now();
+    const workspaceId = typeof call.args.workspace_id === "string" ? call.args.workspace_id : undefined;
+    const clientId = call.extra.authInfo?.clientId;
+    const active = activity?.startCall({
+      tool: call.tool,
+      summary: call.summary,
+      args: call.args,
+      workspace: workspaceId === undefined ? undefined : registry.rootOf(workspaceId),
+      client: clientId === undefined ? undefined : options.clientName?.(clientId) ?? clientId,
+    });
+    let result: ToolResult;
+
+    try {
+      result = await operation(active?.output);
+    } catch (error) {
+      result = textResult(error instanceof Error ? error.message : String(error), true);
+    }
+
+    active?.finish(result, call.extra.signal.aborted);
+
+    const seconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+    const summary = (call.logDetail ?? call.summary).replace(/\s+/g, " ").slice(0, 120);
+    const time = new Date().toLocaleTimeString("en-GB", { hour12: false });
+    console.error(`${time} ${call.tool.padEnd(14)} ${result.isError ? "ERR" : "ok "} ${seconds.padStart(5)}s  ${summary}`);
+
+    return result;
+  };
 
   const server = new McpServer(
     { name: "clouddev-base", title: "clouddev-base", version: VERSION },
@@ -57,7 +100,8 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       },
       annotations: { ...READ_ONLY, title: "Open workspace" },
     },
-    ({ path, create }) => run("open_workspace", path, async () => {
+    (args, extra) => run({ tool: "open_workspace", summary: args.path, args, extra }, async () => {
+      const { path, create } = args;
       const workspace = await registry.open(path, create);
       const listing = await listDirectory(workspace.root, ".");
 
@@ -85,7 +129,8 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       },
       annotations: { ...READ_ONLY, title: "Read file" },
     },
-    ({ workspace_id, path, offset, limit }) => run("read", path, async () => {
+    (args, extra) => run({ tool: "read", summary: args.path, args, extra }, async () => {
+      const { workspace_id, path, offset, limit } = args;
       const workspace = await registry.get(workspace_id);
       const absolute = await registry.resolvePath(workspace, path);
 
@@ -105,7 +150,13 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       },
       annotations: { ...WRITES_FILES, title: "Write file" },
     },
-    ({ workspace_id, path, content }) => run("write", path, async () => {
+    (args, extra) => run({
+      tool: "write",
+      summary: args.path,
+      args: { ...args, content_bytes: Buffer.byteLength(args.content) },
+      extra,
+    }, async () => {
+      const { workspace_id, path, content } = args;
       const workspace = await registry.get(workspace_id);
       const absolute = await registry.resolvePath(workspace, path);
 
@@ -128,7 +179,8 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       },
       annotations: { ...WRITES_FILES, title: "Edit file" },
     },
-    ({ workspace_id, path, edits }) => run("edit", path, async () => {
+    (args, extra) => run({ tool: "edit", summary: args.path, args, extra }, async () => {
+      const { workspace_id, path, edits } = args;
       const workspace = await registry.get(workspace_id);
       const absolute = await registry.resolvePath(workspace, path);
 
@@ -152,7 +204,7 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       },
       annotations: { ...READ_ONLY, title: "Search file contents" },
     },
-    (args, extra) => run("grep", args.pattern, async () => {
+    (args, extra) => run({ tool: "grep", summary: args.pattern, args, extra }, async () => {
       const workspace = await registry.get(args.workspace_id);
       const target = await registry.resolvePath(workspace, args.path ?? ".");
 
@@ -180,7 +232,7 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       },
       annotations: { ...READ_ONLY, title: "Find files" },
     },
-    (args, extra) => run("glob", args.pattern, async () => {
+    (args, extra) => run({ tool: "glob", summary: args.pattern, args, extra }, async () => {
       const workspace = await registry.get(args.workspace_id);
       const dir = await registry.resolvePath(workspace, args.path ?? ".");
 
@@ -203,13 +255,19 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       annotations: { ...RUNS_COMMANDS, title: "Run command" },
     },
     // Commands can contain secrets (tokens, passwords), so only their length is logged by default.
-    (args, extra) => run("bash", logCommands ? args.command : `(${args.command.length}-character command)`, async () => {
+    (args, extra) => run({
+      tool: "bash",
+      summary: args.command,
+      logDetail: logCommands ? args.command : `(${args.command.length}-character command)`,
+      args,
+      extra,
+    }, async (onOutput) => {
       const workspace = await registry.get(args.workspace_id);
       const cwd = args.working_directory ? await registry.resolvePath(workspace, args.working_directory) : workspace.root;
       const stopProgress = reportProgress(extra, progressIntervalMs);
 
       try {
-        return await runCommand(args.command, cwd, args.timeout ?? DEFAULT_TIMEOUT_SECONDS, extra.signal);
+        return await runCommand(args.command, cwd, args.timeout ?? DEFAULT_TIMEOUT_SECONDS, extra.signal, onOutput);
       } finally {
         stopProgress();
       }
@@ -246,23 +304,4 @@ function reportProgress(extra: ToolExtra, intervalMs: number): () => void {
   timer.unref();
 
   return () => clearInterval(timer);
-}
-
-/** Run a tool, turn exceptions into error results, and log one line per call to stderr. */
-async function run(tool: string, detail: string, operation: () => Promise<ToolResult>): Promise<ToolResult> {
-  const startedAt = performance.now();
-  let result: ToolResult;
-
-  try {
-    result = await operation();
-  } catch (error) {
-    result = textResult(error instanceof Error ? error.message : String(error), true);
-  }
-
-  const seconds = ((performance.now() - startedAt) / 1000).toFixed(1);
-  const summary = detail.replace(/\s+/g, " ").slice(0, 120);
-  const time = new Date().toLocaleTimeString("en-GB", { hour12: false });
-  console.error(`${time} ${tool.padEnd(14)} ${result.isError ? "ERR" : "ok "} ${seconds.padStart(5)}s  ${summary}`);
-
-  return result;
 }

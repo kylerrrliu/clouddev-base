@@ -6,6 +6,8 @@ import { expandHome } from "./paths.ts";
 
 export const DEFAULT_PORT = 7676;
 export const DEFAULT_HOST = "127.0.0.1";
+/** The activity page. It always listens on 127.0.0.1 only; 0 turns it off. */
+export const DEFAULT_UI_PORT = 7677;
 
 /** What lives in ~/.clouddev-base/config.json. Every field is optional. */
 export interface StoredConfig {
@@ -14,6 +16,9 @@ export interface StoredConfig {
   port?: number;
   publicUrl?: string;
   allowedRedirectHosts?: string[];
+  uiPort?: number;
+  /** Names of extra environment variables `service install` copies into the launchd job. */
+  serviceEnv?: string[];
 }
 
 export interface Config {
@@ -25,6 +30,10 @@ export interface Config {
   publicUrl: string;
   /** Extra https hosts accepted as OAuth redirect targets. Loopback, which is all Claude Code uses, is always accepted. */
   allowedRedirectHosts: string[];
+  /** Port of the activity page on 127.0.0.1; 0 when it is turned off. */
+  uiPort: number;
+  /** Names of extra environment variables `service install` copies into the launchd job (config.json only). */
+  serviceEnv: string[];
 }
 
 export function homeDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -48,6 +57,7 @@ export interface ConfigOverrides {
   host?: string;
   port?: number;
   publicUrl?: string;
+  uiPort?: number;
 }
 
 /** Merge config.json with command-line overrides into the runtime config. */
@@ -64,6 +74,11 @@ export function loadConfig(overrides: ConfigOverrides = {}, env: NodeJS.ProcessE
 
   const localHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host.includes(":") ? `[${host}]` : host;
   const publicUrl = normalizePublicUrl(overrides.publicUrl ?? stored.publicUrl ?? `http://${localHost}:${port}`);
+  const uiPort = overrides.uiPort ?? stored.uiPort ?? DEFAULT_UI_PORT;
+
+  if (uiPort !== 0 && uiPort === port) {
+    throw new Error(`WebUI 端口不能和 MCP 端口相同（都是 ${port}）。用 --ui-port 换一个，或设为 0 关闭 WebUI。`);
+  }
 
   return {
     homeDir: home,
@@ -72,6 +87,9 @@ export function loadConfig(overrides: ConfigOverrides = {}, env: NodeJS.ProcessE
     port,
     publicUrl,
     allowedRedirectHosts: stored.allowedRedirectHosts ?? [],
+    uiPort,
+    // Checked by `service install`, the only user, so a typo here never stops `serve`.
+    serviceEnv: Array.isArray(stored.serviceEnv) ? stored.serviceEnv.filter((name): name is string => typeof name === "string") : [],
   };
 }
 

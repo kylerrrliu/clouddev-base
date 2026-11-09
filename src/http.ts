@@ -4,19 +4,27 @@ import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middlewar
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isJSONRPCNotification, isJSONRPCRequest, type JSONRPCNotification, type RequestId } from "@modelcontextprotocol/sdk/types.js";
+import {
+  isInitializeRequest,
+  isJSONRPCNotification,
+  isJSONRPCRequest,
+  type JSONRPCNotification,
+  type RequestId,
+} from "@modelcontextprotocol/sdk/types.js";
+import type { ActivityLog } from "./activity.ts";
 import { loadOwnerPassword, type Config } from "./config.ts";
 import { createMcpServer } from "./mcp.ts";
-import { OwnerOAuthProvider, SCOPE } from "./oauth.ts";
+import { OwnerOAuthProvider, SCOPE, type AuthorizationEvent } from "./oauth.ts";
 import type { WorkspaceRegistry } from "./workspaces.ts";
 
 /** Largest JSON body accepted on /mcp: a single `write` carries a whole file. */
 const MAX_MCP_BODY = "20mb";
 
 /**
- * How long an idle connection stays open. A reverse proxy such as Tailscale
- * serve keeps pooled connections to us for about 90 s; with Node's 5 s
- * default it can reuse one just as Node closes it, and that request fails.
+ * How long an idle connection stays open. Whatever sits in front of us (an SSH
+ * tunnel, or a reverse proxy that pools connections for about 90 s) may reuse
+ * an idle connection; with Node's 5 s default it can do so just as Node closes
+ * it, and that request fails.
  */
 export const KEEP_ALIVE_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -34,21 +42,23 @@ export function configureHttpServer<T extends Server>(server: T): T {
 export interface HttpAppOptions {
   config: Config;
   registry: WorkspaceRegistry;
+  /** Receives tool calls, client connections and approvals for the local activity page. */
+  activity?: ActivityLog;
 }
 
 /**
  * Express app serving the OAuth endpoints and a stateless Streamable HTTP
  * MCP endpoint at /mcp. Every /mcp request needs a bearer token.
  */
-export function createHttpApp({ config, registry }: HttpAppOptions) {
+export function createHttpApp({ config, registry, activity }: HttpAppOptions) {
   const publicUrl = new URL(config.publicUrl);
   const mcpUrl = new URL("/mcp", publicUrl);
 
   const app = express();
   app.disable("x-powered-by");
 
-  // A reverse proxy on this machine (tailscale serve) connects from loopback; trust the client IP it forwards.
-  app.set("trust proxy", "loopback");
+  // No "trust proxy": requests arrive through the SSH tunnel from sshd on loopback, and nothing in between sets
+  // X-Forwarded-For. Trusting it would let any client pick its own address and slip past the OAuth rate limits.
 
   // Host header allowlist (DNS-rebinding protection): loopback plus the public hostname.
   app.use(hostHeaderValidation([...new Set(["localhost", "127.0.0.1", "[::1]", publicUrl.hostname])]));
@@ -59,6 +69,7 @@ export function createHttpApp({ config, registry }: HttpAppOptions) {
     resourceUrl: mcpUrl,
     stateDir: config.homeDir,
     allowedRedirectHosts: config.allowedRedirectHosts,
+    onAuthorization: activity && ((event) => reportAuthorization(activity, event)),
   });
 
   // The OAuth endpoints parse their own bodies, with the SDK's default limits.
@@ -79,7 +90,8 @@ export function createHttpApp({ config, registry }: HttpAppOptions) {
   });
 
   app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "clouddev-base" });
+    // The pid lets `service install` and `service status` tell the launchd job from another server on the port.
+    res.json({ ok: true, name: "clouddev-base", pid: process.pid });
   });
 
   const inFlight = new InFlightRequests();
@@ -89,13 +101,20 @@ export function createHttpApp({ config, registry }: HttpAppOptions) {
     const token = req.auth!.token;
     const messages: unknown[] = Array.isArray(req.body) ? req.body : [req.body];
 
-    // A cancellation arrives in a POST of its own: hand it to the request it names.
+    activity?.request();
+
     for (const message of messages) {
+      // A cancellation arrives in a POST of its own: hand it to the request it names.
       if (isJSONRPCNotification(message) && message.method === "notifications/cancelled") inFlight.cancel(token, message);
+
+      // initialize means a client just started or reconnected.
+      if (activity && isInitializeRequest(message)) {
+        activity.clientConnected(message.params.clientInfo, provider.clientName(req.auth!.clientId));
+      }
     }
 
     // Stateless: a fresh server and transport per request. Workspaces live in the shared registry.
-    const server = createMcpServer(registry);
+    const server = createMcpServer(registry, { activity, clientName: (clientId) => provider.clientName(clientId) });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const requestIds = messages.filter(isJSONRPCRequest).map((message) => message.id);
 
@@ -158,6 +177,12 @@ export function createHttpApp({ config, registry }: HttpAppOptions) {
   });
 
   return { app, mcpUrl };
+}
+
+function reportAuthorization(activity: ActivityLog, { outcome, clientName }: AuthorizationEvent): void {
+  if (outcome === "approved") activity.notice(`已批准客户端：${clientName}`);
+  else if (outcome === "wrong_password") activity.notice(`授权页输入了错误的 Owner 密码（客户端：${clientName}）`, "warn");
+  else activity.notice(`授权失败：服务器上没有可用的 Owner 密码（客户端：${clientName}）`, "warn");
 }
 
 type CancelRequest = (notification: JSONRPCNotification) => void;

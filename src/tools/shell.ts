@@ -2,6 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
+import type { Readable } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import { MAX_BYTES, formatSize, splitLines, takeTail, textResult, type ToolResult } from "./common.ts";
 
 export const DEFAULT_TIMEOUT_SECONDS = 30;
@@ -13,11 +15,17 @@ const ROLLING_BUFFER_BYTES = 1024 * 1024;
 /** Wait this long after the shell exits for its output pipes to close. */
 const EXIT_GRACE_MS = 250;
 
+/**
+ * Run a command with bash in its own process group. `onOutput` receives the
+ * combined output as it arrives (for the activity page); the result still
+ * carries only the tail.
+ */
 export async function runCommand(
   command: string,
   cwd: string,
   timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
   signal?: AbortSignal,
+  onOutput?: (text: string) => void,
 ): Promise<ToolResult> {
   // Checked up front: a missing cwd otherwise surfaces as a confusing "spawn /bin/bash ENOENT".
   if (!(await stat(cwd).catch(() => undefined))?.isDirectory()) {
@@ -36,8 +44,27 @@ export async function runCommand(
     windowsHide: true,
   });
 
-  child.stdout?.on("data", (chunk: Buffer) => output.push(chunk));
-  child.stderr?.on("data", (chunk: Buffer) => output.push(chunk));
+  const forward = (stream: Readable | null) => {
+    // One decoder per stream, so a multi-byte character split across chunks stays intact.
+    const decoder = onOutput ? new StringDecoder("utf8") : undefined;
+
+    stream?.on("data", (chunk: Buffer) => {
+      output.push(chunk);
+
+      if (!decoder) return;
+
+      const text = decoder.write(chunk);
+
+      try {
+        if (text) onOutput!(text);
+      } catch {
+        // Showing output is best effort; it must never break the command.
+      }
+    });
+  };
+
+  forward(child.stdout);
+  forward(child.stderr);
 
   let timedOut = false;
   let cancelled = false;

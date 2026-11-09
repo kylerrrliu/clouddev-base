@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ActivityLog, type ActivityEvent } from "../src/activity.ts";
 import { createMcpServer, type McpServerOptions } from "../src/mcp.ts";
 import { WorkspaceRegistry } from "../src/workspaces.ts";
 import { resultText, tempDir } from "./helpers.ts";
@@ -144,4 +145,27 @@ test("long bash commands send progress notifications when the client asks for th
   assert.ok(updates.length >= 3, `expected several progress updates, got ${updates.length}`);
   assert.deepEqual(updates.map((update) => update.progress), updates.map((_, index) => index + 1));
   assert.match(updates[0]!.message ?? "", /^Command still running/);
+});
+
+test("tool calls are reported to the activity log, and bash output arrives while the command runs", async () => {
+  const root = await tempDir();
+  const activity = new ActivityLog();
+  const events: ActivityEvent[] = [];
+  activity.subscribe((event) => events.push(event));
+  const client = await connect(root, { activity });
+  const workspace_id = await openWorkspace(client, root);
+
+  await client.callTool({ name: "bash", arguments: { workspace_id, command: "echo first; sleep 0.6; echo second" } });
+  await client.callTool({ name: "read", arguments: { workspace_id, path: "missing.txt" } });
+
+  const calls = activity.snapshot().calls;
+  assert.deepEqual(calls.map((call) => [call.tool, call.status]), [["open_workspace", "ok"], ["bash", "ok"], ["read", "error"]]);
+  assert.equal(calls[1]!.workspace, root);
+  assert.equal(calls[1]!.summary, "echo first; sleep 0.6; echo second", "the page shows the whole command, unlike the log");
+
+  const bashId = calls[1]!.id;
+  const firstOutput = events.findIndex((event) => event.type === "call.output" && event.id === bashId && event.text.includes("first"));
+  const end = events.findIndex((event) => event.type === "call.end" && event.call.id === bashId);
+  assert.ok(firstOutput !== -1 && firstOutput < end, "output is pushed before the command ends");
+  assert.equal(activity.call(bashId)?.output, "first\nsecond");
 });

@@ -86,6 +86,11 @@ export class WorkspaceRegistry {
     return { id, root, canonicalRoot };
   }
 
+  /** The folder a workspace id stands for, without any checks. Only for display. */
+  rootOf(id: string): string | undefined {
+    return this.roots.get(id);
+  }
+
   /** Resolve a workspace-relative path, refusing anything that escapes the workspace. */
   resolvePath(workspace: Workspace, path: string): Promise<string> {
     return resolveInside(workspace.root, workspace.canonicalRoot, path);

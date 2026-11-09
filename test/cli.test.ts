@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { tempDir } from "./helpers.ts";
 
-import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 // End-to-end checks of `clouddev-base serve` as users run it: a real process on a random port, with its own config dir.
@@ -19,6 +20,7 @@ const REDIRECT_URI = "http://localhost:9999/callback";
 let env: NodeJS.ProcessEnv;
 let serve: ChildProcess;
 let base: string;
+let uiBase: string;
 let output = "";
 
 before(async () => {
@@ -26,8 +28,13 @@ before(async () => {
   delete env.CLOUDDEV_BASE_PASSWORD;
 
   const port = await freePort();
+  const uiPort = await freePort();
   base = `http://127.0.0.1:${port}`;
-  serve = spawn(process.execPath, [CLI, "serve", "--root", await tempDir(), "--port", String(port)], { env, stdio: ["ignore", "pipe", "pipe"] });
+  uiBase = `http://127.0.0.1:${uiPort}`;
+  serve = spawn(process.execPath, [CLI, "serve", "--root", await tempDir(), "--port", String(port), "--ui-port", String(uiPort)], {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   serve.stdout?.on("data", (chunk) => (output += chunk));
   serve.stderr?.on("data", (chunk) => (output += chunk));
 
@@ -122,4 +129,55 @@ test("viewing the password never replaces it, even with a blank CLOUDDEV_BASE_PA
 
   assert.equal(await readFile(authFile, "utf8"), before, "auth.json must not change");
   assert.equal(stdout.trim(), (JSON.parse(before) as { ownerPassword: string }).ownerPassword);
+});
+
+test("serve also starts the WebUI, on 127.0.0.1 only", async () => {
+  assert.match(output, new RegExp(`WebUI: +${uiBase.replaceAll(".", "\\.")}`));
+
+  const page = await fetch(`${uiBase}/`);
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /clouddev-base/);
+
+  const snapshot = (await (await fetch(`${uiBase}/api/snapshot`)).json()) as { server: { mcpUrl: string } };
+  assert.equal(snapshot.server.mcpUrl, `${base}/mcp`);
+});
+
+test("init refuses the same port for MCP and the WebUI, and leaves config.json alone", async () => {
+  const root = await tempDir();
+  await cli("init", "--root", root);
+  const configFile = join(env.CLOUDDEV_BASE_HOME!, "config.json");
+  const before = await readFile(configFile, "utf8");
+
+  await assert.rejects(cli("init", "--root", root, "--port", "8100", "--ui-port", "8100"), (error: { stderr?: string }) => /WebUI 端口不能和 MCP 端口相同/.test(error.stderr ?? ""));
+  assert.equal(await readFile(configFile, "utf8"), before);
+});
+
+test("service install --print shows the launchd job without installing it", async () => {
+  await cli("init", "--root", await tempDir());
+
+  // A throwaway HOME and a launchctl that knows no jobs: if this ever regressed, nothing real gets installed.
+  const home = await tempDir();
+  const bin = await tempDir();
+  await writeFile(join(bin, "launchctl"), "#!/bin/sh\nexit 113\n", { mode: 0o755 });
+  const isolated = (...args: string[]) => promisify(execFile)(process.execPath, [CLI, ...args], { env: { ...env, HOME: home, PATH: `${bin}:${env.PATH}` } });
+
+  const { stdout } = await isolated("service", "install", "--print");
+
+  assert.match(stdout, /<string>com\.clouddev-base\.serve<\/string>/);
+  assert.match(stdout, /<string>serve<\/string>/);
+  assert.match(stdout, /<key>KeepAlive<\/key>/);
+  assert.match(stdout, /<key>CLOUDDEV_BASE_SERVICE<\/key>/, "commands run through the service can tell");
+  assert.ok(stdout.includes(`<string>${env.CLOUDDEV_BASE_HOME}</string>`), "the config folder in use carries over");
+  assert.equal(existsSync(join(home, "Library")), false, "--print writes nothing");
+
+  await assert.rejects(isolated("service", "install", "--port", "9000"), (error: { stderr?: string }) => /不接受 --root、--port/.test(error.stderr ?? ""));
+  await assert.rejects(isolated("service", "restart"), (error: { stderr?: string }) => /用法: clouddev-base service/.test(error.stderr ?? ""));
+});
+
+test("password says when it shows CLOUDDEV_BASE_PASSWORD rather than auth.json", async () => {
+  const { stdout, stderr } = await promisify(execFile)(process.execPath, [CLI, "password"], { env: { ...env, CLOUDDEV_BASE_PASSWORD: "from-the-environment-123" } });
+
+  assert.equal(stdout.trim(), "from-the-environment-123");
+  assert.match(stderr, /CLOUDDEV_BASE_PASSWORD/);
+  assert.match(stderr, /auth\.json/);
 });

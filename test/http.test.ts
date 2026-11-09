@@ -9,6 +9,7 @@ import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ActivityLog, type ActivityEvent } from "../src/activity.ts";
 import { ownerPasswordPath, writeJsonPrivate, type Config } from "../src/config.ts";
 import { configureHttpServer, createHttpApp, KEEP_ALIVE_TIMEOUT_MS } from "../src/http.ts";
 import { WorkspaceRegistry } from "../src/workspaces.ts";
@@ -22,6 +23,7 @@ let httpServer: Server;
 let base: string;
 let projectRoot: string;
 let homeDir: string;
+let activity: ActivityLog;
 
 before(async () => {
   // The app reads the Owner password from auth.json, and an environment value would take precedence.
@@ -42,9 +44,12 @@ before(async () => {
     port: 0,
     publicUrl: base,
     allowedRedirectHosts: ["example.com"],
+    uiPort: 0,
+    serviceEnv: [],
   };
 
-  const { app } = createHttpApp({ config, registry: new WorkspaceRegistry([projectRoot]) });
+  activity = new ActivityLog();
+  const { app } = createHttpApp({ config, registry: new WorkspaceRegistry([projectRoot]), activity });
   httpServer.on("request", app);
 });
 
@@ -440,6 +445,40 @@ test("idle connections stay open for 5 minutes, longer than reverse proxies keep
   assert.equal(headers["x-powered-by"], undefined);
 });
 
+test("/healthz names the process, and X-Forwarded-For cannot dodge the OAuth rate limits", async () => {
+  const health = (await (await fetch(`${base}/healthz`)).json()) as { name: string; pid: number };
+  assert.equal(health.name, "clouddev-base");
+  assert.equal(health.pid, process.pid);
+
+  // A server of its own, so these registrations do not use up the shared server's allowance.
+  const server = configureHttpServer(createServer());
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const config: Config = { homeDir: await tempDir(), allowedRoots: [projectRoot], host: "127.0.0.1", port: 0, publicUrl: url, allowedRedirectHosts: [], uiPort: 0, serviceEnv: [] };
+  server.on("request", createHttpApp({ config, registry: new WorkspaceRegistry([projectRoot]) }).app);
+
+  try {
+    const statuses: number[] = [];
+
+    for (let i = 0; i < 21; i++) {
+      // Requests arrive through the SSH tunnel from loopback; a client could put anything in this header.
+      const response = await fetch(`${url}/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": `203.0.113.${i}` },
+        body: JSON.stringify({ client_name: "flood", redirect_uris: [REDIRECT_URI], token_endpoint_auth_method: "none" }),
+      });
+      await response.text();
+      statuses.push(response.status);
+    }
+
+    assert.deepEqual(statuses.slice(0, 20), Array(20).fill(201));
+    assert.equal(statuses[20], 429, "every request counts against the one loopback address, whatever the header says");
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test("requests with an unexpected Host header are rejected", async () => {
   assert.equal((await get("/healthz", { host: "evil.example" })).status, 403);
   assert.equal((await fetch(`${base}/healthz`)).status, 200);
@@ -479,5 +518,32 @@ test("a late cancellation for a finished request does not hit a newer request wi
   } finally {
     disconnect.abort();
     killLeftovers(pids);
+  }
+});
+
+test("the activity log sees approvals, client connections and tool calls with the client's name", async () => {
+  const events: ActivityEvent[] = [];
+  const unsubscribe = activity.subscribe((event) => events.push(event));
+
+  try {
+    const { client_id } = (await (await registerClient()).json()) as { client_id: string };
+    assert.equal((await authorize(client_id, "a-wrong-password-123")).status, 401);
+    const { tokens } = await authorize(client_id);
+    const client = await connect(tokens!.access_token);
+    const workspace_id = await openWorkspace(client);
+    await client.callTool({ name: "read", arguments: { workspace_id, path: "." } });
+    await client.close();
+
+    const notices = events.flatMap((event) => (event.type === "notice" ? [event.notice] : []));
+    assert.ok(notices.some((notice) => notice.level === "warn" && /错误的 Owner 密码（客户端：Test Host）/.test(notice.message)), JSON.stringify(notices));
+    assert.ok(notices.some((notice) => notice.message === "已批准客户端：Test Host"));
+    assert.ok(notices.some((notice) => notice.message === "Test Host 已连接（http-test 1.0.0）"));
+
+    const finished = events.flatMap((event) => (event.type === "call.end" ? [event.call] : []));
+    assert.deepEqual(finished.map((call) => call.tool), ["open_workspace", "read"]);
+    assert.ok(finished.every((call) => call.client === "Test Host" && call.status === "ok"));
+    assert.ok(Date.now() - activity.snapshot().lastRequestAt! < 5000);
+  } finally {
+    unsubscribe();
   }
 });
