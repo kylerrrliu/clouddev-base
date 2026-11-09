@@ -28,7 +28,7 @@ export interface Config {
   allowedRoots: string[];
   host: string;
   port: number;
-  /** Origin the MCP host uses to reach this server, e.g. https://b-mac.tail1234.ts.net */
+  /** Origin the MCP host uses to reach this server: the SSH tunnel's end on the other computer, e.g. http://127.0.0.1:7676 */
   publicUrl: string;
   /** Extra https hosts accepted as OAuth redirect targets. Loopback, which is all Claude Code uses, is always accepted. */
   allowedRedirectHosts: string[];

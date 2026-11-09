@@ -91,7 +91,7 @@ async function approve(clientId: string, password: string): Promise<number> {
 }
 
 test("serve keeps idle connections open for 5 minutes", async () => {
-  // Node advertises the idle timeout it enforces; its default of 5 s is shorter than reverse proxies keep connections.
+  // Node advertises the idle timeout it enforces; its default of 5 s is shorter than clients keep idle connections for reuse.
   const headers = await new Promise<IncomingHttpHeaders>((resolve, reject) => {
     request(`${base}/healthz`, (res) => {
       res.resume();

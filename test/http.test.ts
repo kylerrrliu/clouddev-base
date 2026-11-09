@@ -429,7 +429,7 @@ test("a cancellation that matches two in-flight requests is ignored", async () =
   }
 });
 
-test("idle connections stay open for 5 minutes, longer than reverse proxies keep them", async () => {
+test("idle connections stay open for 5 minutes, longer than clients keep them for reuse", async () => {
   assert.equal(httpServer.keepAliveTimeout, KEEP_ALIVE_TIMEOUT_MS);
 
   // Node advertises the idle timeout it enforces (5 s by default).

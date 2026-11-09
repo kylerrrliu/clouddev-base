@@ -101,8 +101,6 @@ macOS 的 sshd 每个连接单独启动，改完对新连接生效。
 
 **6.** 接下来在 A 上运行安装脚本时，它会打印一行公钥，**把那一整行加到 B 上这个账号的 `~/.ssh/authorized_keys`**。以前加过这把钥匙（比如改了端口、重新运行了安装脚本）的话，要把旧的那一行换掉，而不是再追加一行：sshd 只认同一把钥匙的第一行。安装脚本还会打印一条命令，能 ssh 登录 B 的话直接运行它，它会替换旧行，并且不会和文件最后一行粘在一起。
 
-**从 Tailscale 迁移过来：** 在 B 上运行 `tailscale serve --https=443 off` 撤掉原来那条转发（也就是旧文档里的 `tailscale serve --bg 7676`；不要用 `tailscale serve reset`，它会清掉 B 上所有 serve 和 funnel 设置。可以先用 `tailscale serve status` 看看有哪些），再用上面第 2 步的 `init --public-url http://127.0.0.1:7676` 把访问地址改成回环地址。旧令牌绑定的是 ts.net 地址，会自动失效，在 A 的 Claude Code 里用 `/mcp` 重新认证一次即可。
-
 ### 在 A（你用来操作的电脑）上
 
 **1. 装好 Claude Code，把本项目的 `client/` 目录拷到 A**（放在哪都行）。
@@ -180,7 +178,7 @@ B 上的服务本身仍然监听 7676。
   - `open failed: connect failed`：B 上的服务没在运行。
 - 立即重连：`launchctl kickstart -k gui/$(id -u)/com.clouddev-base.tunnel`。
 
-**和 Tailscale 相比的代价：** SSH 隧道是一条 TCP 连接，A 换网络或者睡眠唤醒后会断，约 40 秒内发现并自动重连（前提是网络已经恢复）。断开那一刻正在执行的工具调用会失败，B 上对应的命令会在 B 发现断线后结束（见 B 的第 5 步）。如果 Claude Code 是在隧道连通之前启动的，在 `/mcp` 里重连一下即可。
+**SSH 隧道的局限：** 隧道是一条 TCP 连接，A 换网络或者睡眠唤醒后会断，约 40 秒内发现并自动重连（前提是网络已经恢复）。断开那一刻正在执行的工具调用会失败，B 上对应的命令会在 B 发现断线后结束（见 B 的第 5 步）。如果 Claude Code 是在隧道连通之前启动的，在 `/mcp` 里重连一下即可。
 
 ### B 上的 WebUI
 
@@ -366,7 +364,7 @@ WantedBy=default.target
   - `command="/usr/bin/false"` 让它即使请求 shell、scp、sftp 也只会执行 `false`。
 
   这些前缀只管 TCP 端口，管不到 Unix socket 的反向转发（`ssh -R /路径.sock:…`，能在 B 上任意可写的位置放一个 socket，把 B 上程序的连接转给对方），所以 B 的 sshd 还要设置 `AllowStreamLocalForwarding local`（“在 B 上”第 5 步）。两样都做了，这把钥匙即使被偷，也只能碰到 7676，而 7676 还要 OAuth 令牌和 Owner 密码。不要去掉这些限制，也不要把它加到能做别的事的账号设置里。
-- 不要把 7676 端口直接开放到网络上（改 `--host`、做端口映射，或者用 cloudflared、ngrok、`tailscale funnel` 之类的工具），那样挡住别人的就只剩 Owner 密码和授权令牌了。B 的 SSH 端口要暴露到公网时，按“在 B 上”第 5 步只允许密钥登录。
+- 不要把 7676 端口直接开放到网络上（改 `--host`、做端口映射，或者用 cloudflared、ngrok 之类的工具），那样挡住别人的就只剩 Owner 密码和授权令牌了。B 的 SSH 端口要暴露到公网时，按“在 B 上”第 5 步只允许密钥登录。
 - 服务端日志（终端里，或后台服务的 `~/Library/Logs/clouddev-base.log`）逐行记录每次工具调用（工具名、文件路径或搜索模式、耗时）。命令里可能带密钥，所以 `bash` 默认只记录命令长度；想看到完整命令，启动前设置环境变量 `CLOUDDEV_BASE_LOG_COMMANDS=1`（`service install` 会把它带进后台服务，并提示你）。后台服务的日志超过 10MB 时，旧的内容挪到 `clouddev-base.log.1`（只留一份）；服务自动生成 Owner 密码时也不会把它写进日志。
 - WebUI 只监听 127.0.0.1，在 B 本机才能打开。里面的命令全文只保存在内存里，不写磁盘。
 

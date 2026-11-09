@@ -23,10 +23,9 @@ import type { WorkspaceRegistry } from "./workspaces.ts";
 const MAX_MCP_BODY = "20mb";
 
 /**
- * How long an idle connection stays open. Whatever sits in front of us (an SSH
- * tunnel, or a reverse proxy that pools connections for about 90 s) may reuse
- * an idle connection; with Node's 5 s default it can do so just as Node closes
- * it, and that request fails.
+ * How long an idle connection stays open. Clients such as Claude Code keep
+ * their connections (through the SSH tunnel) open and reuse them; with Node's
+ * 5 s default one can be reused just as Node closes it, and that request fails.
  */
 export const KEEP_ALIVE_TIMEOUT_MS = 5 * 60 * 1000;
 
