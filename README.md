@@ -156,6 +156,20 @@ B 上的服务本身仍然监听 7676。
 
 如果客户端在请求里要求了进度通知（带 `progressToken`），命令运行期间服务每 20 秒发一次，也会重置空闲计时；客户端没要求时不发，但上面的 330 秒已经足够覆盖最长的命令。
 
+**安装 skill。** skill 由 A 上的 Claude Code 读取，装在 B 上的 skill 它读不到。从 `client/` 启动的 Claude Code 在 A 上写不了文件、也执行不了命令（见上面的“禁用的工具”），B 上的 `write` 又只能写工作区，所以 Claude 自己装不了 skill，要你在 A 上装：
+
+- 插件：在会话里运行 `/plugin install <插件>@<市场>`。官方市场以外的插件，先用 `/plugin marketplace add <所有者>/<仓库>` 添加它所在的市场。这些是 Claude Code 自己执行的命令，不受 `deny` 限制。
+- 单个 skill 目录：在 A 的终端里拷到 `client/.claude/skills/<名字>/`（只对从 `client/` 启动的 Claude Code 生效），或者 `~/.claude/skills/<名字>/`（A 上所有项目都生效）。
+
+装之前先看它带了什么：
+
+- 插件可以带 hooks 和 MCP 服务器，skill 的 `SKILL.md` 开头可以声明 `hooks`。hooks 在 A 上执行命令，`deny` 里的 `Bash` 管不到。
+- skill 还可以声明 `allowed-tools`：调用这个 skill 的那一轮，列出的工具不用你批准就能用。比如列了 `mcp__clouddev-base__bash`，那一轮在 B 上执行命令就不再问你。
+
+也因为这样，不要为了让 Claude 自己装 skill 去放开 `Write`、`Edit` 或 `Bash`：能写 skill，就能借它的 hooks 在 A 上执行命令。
+
+从 `client/` 启动时，Claude 只用得上 `SKILL.md` 的正文。skill 附带的参考文件和脚本要靠 A 上的 `Read`、`Bash` 才能读、才能跑，这里都禁用了，所以纯说明、不带脚本的 skill 最适合。要用 skill 自带的脚本处理 B 上的文件时，让 Claude 用 `bash` 把脚本拉到 B 上、装好依赖，每条命令照常先问你。
+
 ### 隧道怎样保活和自动重连
 
 隧道就是 launchd 运行的 `ssh -N -n -F ~/.clouddev-tunnel/ssh_config clouddev-b`，不需要 autossh：
@@ -354,6 +368,7 @@ WantedBy=default.target
 ## 安全须知
 
 - 连上的 AI 等同于一个能操作你电脑的协作者。文件工具被限制在工作区内，但 **`bash` 不是沙箱**，命令以你的用户权限运行。
+- skill 和插件都能带 hooks，在 A 上执行命令，`client/.claude/settings.json` 的 `deny` 管不到。装之前自己看一遍，也不要为了让 Claude 自己装去放开那里禁用的工具（见“在 A 上”的“安装 skill”）。
 - 每个新客户端都必须在授权页输入 Owner 密码才能拿到令牌。密码不要外泄；授权页会显示授权后跳转的域名，只批准你自己发起的连接。授权成功和密码输错都会显示在 B 的 WebUI 上。
 - 要让所有已连接的客户端失效：删除 `~/.clouddev-base/oauth.json`。运行中的服务（包括后台服务）立即生效、不用重启，不会再把旧的客户端和令牌写回去；之后每个客户端都要重新输入 Owner 密码授权。`clouddev-base password --reset` 生成新密码，同样立即生效，但它不会注销已连接的客户端，两件事要一起做。
 - 服务只监听 127.0.0.1，别的电脑只能经 SSH 隧道访问它。A 上的隧道密钥没有口令（这样后台运行才不用等人输入），所以它在 B 上被 `authorized_keys` 的前缀限制住了：
