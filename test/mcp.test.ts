@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ActivityLog, type ActivityEvent } from "../src/activity.ts";
+import { ActivityLog } from "../src/activity.ts";
 import { createMcpServer, type McpServerOptions } from "../src/mcp.ts";
 import { WorkspaceRegistry } from "../src/workspaces.ts";
-import { resultText, tempDir } from "./helpers.ts";
+import { captureStderr, recordEvents, resultText, tempDir } from "./helpers.ts";
 
 async function connect(allowedRoot: string, options: McpServerOptions = {}): Promise<Client> {
   const server = createMcpServer(new WorkspaceRegistry([allowedRoot]), options);
@@ -95,22 +95,6 @@ async function openWorkspace(client: Client, path: string): Promise<string> {
   return workspaceId;
 }
 
-async function captureStderr(operation: () => Promise<void>): Promise<string[]> {
-  const original = console.error;
-  const lines: string[] = [];
-  console.error = (...args: unknown[]) => {
-    lines.push(args.map(String).join(" "));
-  };
-
-  try {
-    await operation();
-  } finally {
-    console.error = original;
-  }
-
-  return lines;
-}
-
 test("bash commands are logged by length only unless command logging is turned on", async () => {
   const root = await tempDir();
 
@@ -150,18 +134,25 @@ test("long bash commands send progress notifications when the client asks for th
 test("tool calls are reported to the activity log, and bash output arrives while the command runs", async () => {
   const root = await tempDir();
   const activity = new ActivityLog();
-  const events: ActivityEvent[] = [];
-  activity.subscribe((event) => events.push(event));
-  const client = await connect(root, { activity });
+  const events = recordEvents(activity);
+  const client = await connect(root, { activity, client: "Claude Code" });
   const workspace_id = await openWorkspace(client, root);
 
   await client.callTool({ name: "bash", arguments: { workspace_id, command: "echo first; sleep 0.6; echo second" } });
   await client.callTool({ name: "read", arguments: { workspace_id, path: "missing.txt" } });
+  await client.callTool({ name: "write", arguments: { workspace_id, path: "a.txt", content: "x".repeat(2048) } });
+  await client.callTool({ name: "edit", arguments: { workspace_id, path: "a.txt", edits: [{ old_text: "x".repeat(2048), new_text: "y" }] } });
 
   const calls = activity.snapshot().calls;
-  assert.deepEqual(calls.map((call) => [call.tool, call.status]), [["open_workspace", "ok"], ["bash", "ok"], ["read", "error"]]);
+  assert.deepEqual(calls.map((call) => [call.tool, call.status]), [["open_workspace", "ok"], ["bash", "ok"], ["read", "error"], ["write", "ok"], ["edit", "ok"]]);
   assert.equal(calls[1]!.workspace, root);
+  assert.equal(calls[1]!.client, "Claude Code");
   assert.equal(calls[1]!.summary, "echo first; sleep 0.6; echo second", "the page shows the whole command, unlike the log");
+
+  // What the page shows next to the arguments: the timeout in effect, the size written, how many edits there were.
+  assert.equal(activity.call(calls[1]!.id)?.args.timeout, 30);
+  assert.equal(activity.call(calls[3]!.id)?.args.content_size, "2.0KB");
+  assert.equal(activity.call(calls[4]!.id)?.args.edits_count, 1);
 
   const bashId = calls[1]!.id;
   const firstOutput = events.findIndex((event) => event.type === "call.output" && event.id === bashId && event.text.includes("first"));

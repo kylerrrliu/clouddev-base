@@ -6,8 +6,10 @@ import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelconte
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   isInitializeRequest,
+  isJSONRPCErrorResponse,
   isJSONRPCNotification,
   isJSONRPCRequest,
+  isJSONRPCResultResponse,
   type JSONRPCNotification,
   type RequestId,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -98,8 +100,9 @@ export function createHttpApp({ config, registry, activity }: HttpAppOptions) {
 
   // The large body limit applies only once the token is verified: anonymous bodies are never parsed.
   app.post("/mcp", requireToken, express.json({ limit: MAX_MCP_BODY }), async (req: Request, res: Response) => {
-    const token = req.auth!.token;
+    const { token, clientId } = req.auth!;
     const messages: unknown[] = Array.isArray(req.body) ? req.body : [req.body];
+    const label = provider.clientName(clientId);
 
     activity?.request();
 
@@ -108,15 +111,16 @@ export function createHttpApp({ config, registry, activity }: HttpAppOptions) {
       if (isJSONRPCNotification(message) && message.method === "notifications/cancelled") inFlight.cancel(token, message);
 
       // initialize means a client just started or reconnected.
-      if (activity && isInitializeRequest(message)) {
-        activity.clientConnected(message.params.clientInfo, provider.clientName(req.auth!.clientId));
-      }
+      if (activity && isInitializeRequest(message)) activity.clientConnected(message.params.clientInfo, label);
     }
 
     // Stateless: a fresh server and transport per request. Workspaces live in the shared registry.
-    const server = createMcpServer(registry, { activity, clientName: (clientId) => provider.clientName(clientId) });
+    const calls = activity ? toolCalls(messages) : new Map<RequestId, ToolCall>();
+    const server = createMcpServer(registry, { activity, client: label ?? clientId, onToolCall: (id) => calls.delete(id) });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const requestIds = messages.filter(isJSONRPCRequest).map((message) => message.id);
+
+    if (activity && calls.size > 0) reportRefusedCalls(transport, calls, activity, label ?? clientId);
 
     const untrack = requestIds.map((id) => inFlight.add(token, id, (notification) => {
       if (requestIds.length === 1) {
@@ -177,6 +181,60 @@ export function createHttpApp({ config, registry, activity }: HttpAppOptions) {
   });
 
   return { app, mcpUrl };
+}
+
+interface ToolCall {
+  name: string;
+  args: Record<string, unknown>;
+}
+
+/** The tools/call requests in a POST body, by id. */
+function toolCalls(messages: unknown[]): Map<RequestId, ToolCall> {
+  const calls = new Map<RequestId, ToolCall>();
+
+  for (const message of messages) {
+    if (!isJSONRPCRequest(message) || message.method !== "tools/call") continue;
+
+    const { name, arguments: args } = (message.params ?? {}) as { name?: unknown; arguments?: unknown };
+    calls.set(message.id, { name: String(name ?? ""), args: args && typeof args === "object" ? (args as Record<string, unknown>) : {} });
+  }
+
+  return calls;
+}
+
+/**
+ * Tool calls the SDK answers by itself, before any tool runs (arguments that do not fit the tool's schema, an
+ * unknown tool), never reach `run` in mcp.ts, which reports the others. Their answers are watched on the way
+ * out, so the activity page lists them as errors too. `calls` holds the ids no tool has picked up.
+ */
+function reportRefusedCalls(transport: StreamableHTTPServerTransport, calls: Map<RequestId, ToolCall>, activity: ActivityLog, client: string): void {
+  const send = transport.send.bind(transport);
+
+  transport.send = async (message, options) => {
+    if ((isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) && message.id !== undefined) {
+      const refused = calls.get(message.id);
+
+      if (refused) {
+        calls.delete(message.id);
+        const text = "error" in message ? message.error.message : errorText(message.result);
+
+        if (text !== undefined) activity.rejectedCall({ tool: refused.name, args: refused.args, client, message: text });
+      }
+    }
+
+    return send(message, options);
+  };
+}
+
+/** The text of an error tool result, or undefined for a successful one. */
+function errorText(result: unknown): string | undefined {
+  const { isError, content } = (result ?? {}) as { isError?: unknown; content?: unknown };
+
+  if (isError !== true) return undefined;
+
+  return Array.isArray(content)
+    ? content.map((item) => (item && typeof item === "object" && "text" in item ? String(item.text) : "")).join("\n")
+    : "";
 }
 
 function reportAuthorization(activity: ActivityLog, { outcome, clientName }: AuthorizationEvent): void {

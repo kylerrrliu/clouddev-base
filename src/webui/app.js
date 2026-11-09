@@ -14,9 +14,7 @@
   };
   const STATUS = { running: "进行中", ok: "完成", error: "出错", cancelled: "已中止" };
   const STATUS_TITLE = { cancelled: "客户端取消了这次调用，或者连接断开了" };
-  const MAX_ROWS = 500;
-  const MAX_NOTICES = 200;
-  const LIVE_LIMIT = 64 * 1024;
+  const UNDELIVERED = "客户端取消了调用或者断开了，结果没有送到；操作本身已经完成";
 
   const $ = (id) => document.getElementById(id);
   const els = {
@@ -46,7 +44,8 @@
     client: undefined,
     calls: new Map(),
     live: new Map(),
-    notices: [],
+    // What the server keeps; the snapshot says.
+    limits: { calls: 500, notices: 200 },
   };
   /** Finished calls, by id: <details> rows in the history list. */
   const rows = new Map();
@@ -114,14 +113,6 @@
     return `${Math.floor(m / 1440)} 天 ${Math.floor((m % 1440) / 60)} 小时`;
   }
 
-  function size(bytes) {
-    if (typeof bytes !== "number") return undefined;
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-
-    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  }
-
   function basename(path) {
     return String(path).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || String(path);
   }
@@ -177,7 +168,7 @@
         h("span", { class: "ws", text: call.workspace ? basename(call.workspace) : "", title: call.workspace }),
         h("span", { class: "dur", text: call.endedAt ? duration(call.endedAt - call.startedAt) : "" }),
         h("span", { class: `status status-${call.status}`, text: STATUS[call.status] || call.status, title: STATUS_TITLE[call.status] }),
-        failed && call.brief && h("span", { class: "brief", text: call.brief, title: call.brief })),
+        briefLine(call, failed)),
       body);
 
     row.addEventListener("toggle", () => {
@@ -185,6 +176,20 @@
     });
 
     return row;
+  }
+
+  /** The line under a row: what went wrong, and whether the result never reached the client. */
+  function briefLine(call, failed) {
+    const parts = [];
+
+    if (failed && call.brief) parts.push(call.brief);
+    if (call.undelivered) parts.push(`未送达：${UNDELIVERED}`);
+
+    if (parts.length === 0) return undefined;
+
+    const text = parts.join(" · ");
+
+    return h("span", { class: call.undelivered && !failed ? "brief brief-quiet" : "brief", text, title: text });
   }
 
   async function loadDetail(id, body) {
@@ -225,6 +230,7 @@
     fact("开始", new Date(call.startedAt).toLocaleString("zh-CN", { hour12: false }));
     if (call.endedAt) fact("耗时", duration(call.endedAt - call.startedAt));
     fact("状态", STATUS[call.status] || call.status);
+    if (call.undelivered) fact("注意", UNDELIVERED);
 
     switch (call.tool) {
       case "open_workspace":
@@ -237,12 +243,16 @@
         break;
       case "write":
         fact("路径", args.path, true);
-        fact("大小", size(args.content_bytes));
+        fact("大小", args.content_size);
         break;
-      case "edit":
+      case "edit": {
+        const shown = Array.isArray(args.edits) ? args.edits.length : 0;
+        const count = typeof args.edits_count === "number" ? args.edits_count : shown;
+
         fact("路径", args.path, true);
-        fact("修改处数", Array.isArray(args.edits) ? args.edits.length : undefined);
+        fact("修改处数", count > shown ? `${count}（下面只列出前 ${shown} 处）` : count);
         break;
+      }
       case "grep":
         fact("正则", args.pattern, true);
         fact("范围", args.path, true);
@@ -256,7 +266,7 @@
         break;
       case "bash":
         fact("目录", args.working_directory || "（工作区根目录）", true);
-        fact("超时", `${args.timeout || 30} 秒`);
+        if (args.timeout) fact("超时", `${args.timeout} 秒`);
         break;
     }
 
@@ -335,7 +345,7 @@
   }
 
   function dropOldRows() {
-    while (rows.size > MAX_ROWS) {
+    while (rows.size > state.limits.calls) {
       const oldest = Math.min(...rows.keys());
       rows.get(oldest).remove();
       rows.delete(oldest);
@@ -364,16 +374,15 @@
       h("span", { class: notice.level === "warn" ? "warn" : undefined, text: notice.message }));
   }
 
-  function renderNotices() {
-    els.notices.replaceChildren(...state.notices.slice(-MAX_NOTICES).reverse().map(noticeItem));
-    els.noticesEmpty.classList.toggle("hidden", state.notices.length > 0);
+  function renderNotices(notices) {
+    els.notices.replaceChildren(...notices.slice().reverse().map(noticeItem));
+    els.noticesEmpty.classList.toggle("hidden", notices.length > 0);
   }
 
   function addNotice(notice) {
-    state.notices.push(notice);
     els.notices.prepend(noticeItem(notice));
 
-    while (els.notices.children.length > MAX_NOTICES) els.notices.lastElementChild.remove();
+    while (els.notices.children.length > state.limits.notices) els.notices.lastElementChild.remove();
 
     els.noticesEmpty.classList.add("hidden");
   }
@@ -406,7 +415,7 @@
     state.client = snapshot.client;
     state.calls = new Map(snapshot.calls.map((call) => [call.id, call]));
     state.live = new Map(Object.entries(snapshot.live || {}).map(([id, text]) => [Number(id), text]));
-    state.notices = snapshot.notices || [];
+    if (snapshot.limits) state.limits = snapshot.limits;
 
     rows.clear();
     cards.clear();
@@ -415,7 +424,7 @@
 
     for (const call of snapshot.calls) place(call, open.has(call.id));
 
-    renderNotices();
+    renderNotices(snapshot.notices || []);
     renderOverview();
     updateCounts();
   }
@@ -431,14 +440,13 @@
         updateCounts();
         break;
       case "call.output": {
+        // Each event carries the whole output so far (its end, when long), already cut to size by the server.
         const card = cards.get(event.id);
 
         if (!card) break;
 
-        const text = event.replace ? event.text : (state.live.get(event.id) || "") + event.text;
-        const kept = text.length > LIVE_LIMIT ? text.slice(-LIVE_LIMIT) : text;
-        state.live.set(event.id, kept);
-        showLive(card, kept);
+        state.live.set(event.id, event.text);
+        showLive(card, event.text);
         break;
       }
       case "call.end": {
@@ -471,16 +479,26 @@
   }
 
   function setConnection(kind) {
-    const labels = { ok: "已连接服务", lost: "与服务断开，正在重连…", waiting: "正在连接…" };
+    const labels = { ok: "已连接服务", lost: "与服务断开，正在重连…", waiting: "正在连接…", paused: "页面在后台，暂停更新" };
     els.connection.className = `pill ${kind === "ok" ? "pill-ok" : kind === "lost" ? "pill-bad" : "pill-wait"}`;
     els.connection.textContent = labels[kind];
   }
 
-  function connect() {
-    const source = new EventSource("/api/stream");
+  // A browser opens at most six connections to one host, and every open page holds one for its event stream.
+  // Pages in the background therefore let go of theirs, and catch up from the snapshot when shown again.
+  let source;
+  let retry;
 
-    source.onopen = () => setConnection("ok");
-    source.onmessage = (message) => {
+  function connect() {
+    if (source || document.hidden) return;
+
+    clearTimeout(retry);
+    setConnection("waiting");
+    const current = new EventSource("/api/stream");
+    source = current;
+
+    current.onopen = () => setConnection("ok");
+    current.onmessage = (message) => {
       let event;
 
       try {
@@ -491,13 +509,28 @@
 
       handle(event);
     };
-    source.onerror = () => {
+    current.onerror = () => {
       setConnection("lost");
 
       // EventSource retries by itself unless the server answered with an error status (e.g. too many open pages).
-      if (source.readyState === EventSource.CLOSED) setTimeout(connect, 5000);
+      if (current.readyState === EventSource.CLOSED && source === current) {
+        source = undefined;
+        retry = setTimeout(connect, 5000);
+      }
     };
   }
+
+  function disconnect() {
+    clearTimeout(retry);
+
+    if (!source) return;
+
+    source.close();
+    source = undefined;
+    setConnection("paused");
+  }
+
+  document.addEventListener("visibilitychange", () => (document.hidden ? disconnect() : connect()));
 
   // ---- Start
 
@@ -517,6 +550,8 @@
   });
 
   setInterval(() => {
+    if (document.hidden) return;
+
     for (const card of cards.values()) card.elapsed.textContent = duration(Date.now() - card.startedAt);
 
     renderOverview();

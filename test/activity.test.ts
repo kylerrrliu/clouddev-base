@@ -1,19 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { ActivityLog, MAX_CALLS, MAX_LIVE_OUTPUT_CHARS, MAX_RESULT_CHARS, type ActivityEvent } from "../src/activity.ts";
+import { ActivityLog, MAX_CALLS, MAX_LIVE_OUTPUT_CHARS, MAX_NOTICES, MAX_RESULT_CHARS } from "../src/activity.ts";
 import { textResult } from "../src/tools/common.ts";
-
-function record(log: ActivityLog): ActivityEvent[] {
-  const events: ActivityEvent[] = [];
-  log.subscribe((event) => events.push(event));
-
-  return events;
-}
+import { captureStderr, recordEvents } from "./helpers.ts";
 
 test("a call is reported when it starts and when it ends, with its outcome", () => {
   const log = new ActivityLog();
-  const events = record(log);
+  const events = recordEvents(log);
 
   const call = log.startCall({ tool: "read", summary: "src/a.ts", args: { workspace_id: "ws_1", path: "src/a.ts" }, workspace: "/w/app", client: "Claude Code" });
   assert.equal(log.snapshot().calls[0]?.status, "running");
@@ -40,10 +34,10 @@ test("a call is reported when it starts and when it ends, with its outcome", () 
 test("errors and cancellations are told apart; bash keeps the end of its output", () => {
   const log = new ActivityLog();
 
-  const failed = log.startCall({ tool: "bash", summary: "npm test", args: {} });
+  const failed = log.startCall({ tool: "bash", summary: "npm test", args: {}, cancellable: true });
   failed.finish(textResult("1 failing\n\nCommand exited with code 1.", true), false);
 
-  const cancelled = log.startCall({ tool: "bash", summary: "sleep 100", args: {} });
+  const cancelled = log.startCall({ tool: "bash", summary: "sleep 100", args: {}, cancellable: true });
   cancelled.finish(textResult("Command was cancelled.", true), true);
 
   const [first, second] = log.snapshot().calls;
@@ -63,27 +57,55 @@ test("errors and cancellations are told apart; bash keeps the end of its output"
   assert.ok(log.call(read.id)!.output.startsWith("START"), "other tools keep the beginning");
 });
 
+test("a tool that finishes despite a cancel keeps its outcome and is marked as not delivered", () => {
+  const log = new ActivityLog();
+
+  const written = log.startCall({ tool: "write", summary: "a.txt", args: {} });
+  written.finish(textResult("Overwrote a.txt (21B)."), true);
+  const refused = log.startCall({ tool: "write", summary: "dir", args: {} });
+  refused.finish(textResult("dir is a directory.", true), true);
+
+  const [first, second] = log.snapshot().calls;
+  assert.equal(first?.status, "ok", "the file was written");
+  assert.equal(first?.undelivered, true);
+  assert.equal(second?.status, "error", "an error stays an error");
+  assert.equal(second?.undelivered, true);
+});
+
+test("calls the server refused before running them are listed as errors", () => {
+  const log = new ActivityLog();
+  const events = recordEvents(log);
+
+  log.rejectedCall({ tool: "bash", args: { workspace_id: "ws_1", command: "make test", timeout: 600 }, client: "Claude Code", message: "Input validation error: timeout must be at most 300" });
+
+  assert.deepEqual(events.map((event) => event.type), ["call.end"]);
+  const [call] = log.snapshot().calls;
+  assert.equal(call?.status, "error");
+  assert.equal(call?.summary, "make test");
+  assert.equal(call?.client, "Claude Code");
+  assert.match(call?.brief ?? "", /timeout must be at most 300/);
+});
+
 test("live output is batched, capped and visible in snapshots while the call runs", async () => {
   const log = new ActivityLog();
-  const events = record(log);
+  const events = recordEvents(log);
   const call = log.startCall({ tool: "bash", summary: "npm test", args: {} });
 
   call.output("one\n");
   call.output("two\n");
   assert.equal(events.filter((event) => event.type === "call.output").length, 0, "output is sent in batches");
-  assert.equal(log.snapshot().live[call.id], undefined, "text still waiting for its batch is not in snapshots yet");
-
-  await delay(400);
-  const batches = events.filter((event) => event.type === "call.output");
-  assert.deepEqual(batches, [{ type: "call.output", id: call.id, text: "one\ntwo\n", replace: false }]);
   assert.equal(log.snapshot().live[call.id], "one\ntwo\n");
 
-  // More than a batch can carry: the kept tail replaces what viewers have.
-  call.output("z".repeat(MAX_LIVE_OUTPUT_CHARS + 10));
+  await delay(400);
+  assert.deepEqual(events.filter((event) => event.type === "call.output"), [{ type: "call.output", id: call.id, text: "one\ntwo\n" }]);
+
+  // Each batch carries the whole output so far, cut to its end when long.
+  call.output("z".repeat(3 * MAX_LIVE_OUTPUT_CHARS));
+  call.output("THE END");
   await delay(400);
   const last = events.at(-1);
-  assert.equal(last?.type, "call.output");
-  assert.ok(last?.type === "call.output" && last.replace && last.text.length === MAX_LIVE_OUTPUT_CHARS);
+  assert.ok(last?.type === "call.output" && last.text.length === MAX_LIVE_OUTPUT_CHARS && last.text.endsWith("THE END"));
+  assert.equal(log.snapshot().live[call.id], last.text);
   assert.equal(log.call(call.id)?.outputTruncated, true);
 
   call.finish(textResult("done"), false);
@@ -93,7 +115,7 @@ test("live output is batched, capped and visible in snapshots while the call run
   assert.equal(log.snapshot().live[call.id], undefined);
 });
 
-test("a viewer that joins between batches sees each piece of output exactly once", async () => {
+test("a viewer that joins between batches shows exactly what the server has", async () => {
   const log = new ActivityLog();
   const call = log.startCall({ tool: "bash", summary: "npm test", args: {} });
 
@@ -104,7 +126,7 @@ test("a viewer that joins between batches sees each piece of output exactly once
   // What the WebUI does on (re)connect: take a snapshot, subscribe, then apply events the way app.js does.
   let shown = log.snapshot().live[call.id] ?? "";
   log.subscribe((event) => {
-    if (event.type === "call.output" && event.id === call.id) shown = event.replace ? event.text : shown + event.text;
+    if (event.type === "call.output" && event.id === call.id) shown = event.text;
   });
 
   call.output("line 3\n");
@@ -122,11 +144,12 @@ test("only the newest calls are kept, and running calls are never dropped", () =
     log.startCall({ tool: "read", summary: `file-${i}`, args: {} }).finish(textResult("ok"), false);
   }
 
-  const { calls } = log.snapshot();
+  const { calls, limits } = log.snapshot();
   assert.equal(calls.length, MAX_CALLS);
   assert.equal(calls[0]?.id, running.id, "the running call is still there");
   assert.equal(calls.at(-1)?.summary, `file-${MAX_CALLS + 19}`);
   assert.equal(log.call(2), undefined, "the oldest finished calls are gone");
+  assert.deepEqual(limits, { calls: MAX_CALLS, notices: MAX_NOTICES }, "the page learns the limits from the snapshot");
 });
 
 test("long arguments are cut, and multi-line commands fit on one line", () => {
@@ -134,14 +157,16 @@ test("long arguments are cut, and multi-line commands fit on one line", () => {
   const call = log.startCall({
     tool: "write",
     summary: "echo a\necho b",
-    args: { path: "big.txt", content: "c".repeat(20_000), edits: [{ old_text: "o".repeat(20_000), new_text: "n" }] },
+    args: { path: "big.txt", content: "c".repeat(20_000), edits: Array.from({ length: 150 }, () => ({ old_text: "o".repeat(20_000), new_text: "n" })) },
   });
 
   const detail = log.call(call.id)!;
   assert.equal(detail.summary, "echo a ⏎ echo b");
   assert.ok((detail.args.content as string).length < 9000);
   assert.match(detail.args.content as string, /后面还有 11808 个字符/);
-  assert.ok(((detail.args.edits as Array<{ old_text: string }>)[0]!.old_text).length < 9000);
+  const edits = detail.args.edits as Array<{ old_text: string }>;
+  assert.equal(edits.length, 100, "long arrays keep their first items");
+  assert.ok(edits[0]!.old_text.length < 9000);
 });
 
 test("a huge command with long runs of spaces is summarised quickly", () => {
@@ -155,29 +180,27 @@ test("a huge command with long runs of spaces is summarised quickly", () => {
   assert.ok(summary.length <= 500);
 });
 
-test("a failing viewer cannot break a tool call", () => {
+test("a failing viewer cannot break a tool call", async () => {
   const log = new ActivityLog();
-  const original = console.error;
-  console.error = () => {};
+  let events: ReturnType<typeof recordEvents> = [];
 
-  try {
+  const printed = await captureStderr(() => {
     log.subscribe(() => {
       throw new Error("viewer bug");
     });
-    const events = record(log);
+    events = recordEvents(log);
 
     const call = log.startCall({ tool: "glob", summary: "*.ts", args: {} });
     call.finish(textResult("a.ts"), false);
+  });
 
-    assert.deepEqual(events.map((event) => event.type), ["call.start", "call.end"]);
-  } finally {
-    console.error = original;
-  }
+  assert.deepEqual(events.map((event) => event.type), ["call.start", "call.end"]);
+  assert.match(printed.join("\n"), /viewer bug/);
 });
 
 test("requests, client connections and notices are recorded", () => {
   const log = new ActivityLog();
-  const events = record(log);
+  const events = recordEvents(log);
 
   log.request(1_000);
   log.request(1_500);

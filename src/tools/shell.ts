@@ -46,19 +46,20 @@ export async function runCommand(
 
   const forward = (stream: Readable | null) => {
     // One decoder per stream, so a multi-byte character split across chunks stays intact.
-    const decoder = onOutput ? new StringDecoder("utf8") : undefined;
+    const decoder = new StringDecoder("utf8");
 
     stream?.on("data", (chunk: Buffer) => {
       output.push(chunk);
 
-      if (!decoder) return;
+      if (!onOutput) return;
 
       const text = decoder.write(chunk);
 
+      // An exception thrown inside a stream event would take the whole server down; showing output is best effort.
       try {
-        if (text) onOutput!(text);
+        if (text) onOutput(text);
       } catch {
-        // Showing output is best effort; it must never break the command.
+        // Ignored.
       }
     });
   };

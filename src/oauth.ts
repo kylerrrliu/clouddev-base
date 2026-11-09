@@ -12,6 +12,7 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { readJson, writeJsonPrivate } from "./config.ts";
+import { escapeMarkup as escapeHtml } from "./markup.ts";
 
 export const SCOPE = "clouddev-base";
 
@@ -203,11 +204,7 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
   }
 
   private reportAuthorization(outcome: AuthorizationEvent["outcome"], client: OAuthClientInformationFull): void {
-    try {
-      this.options.onAuthorization?.({ outcome, clientName: client.client_name ?? client.client_id });
-    } catch (error) {
-      console.error("Authorization listener failed:", error);
-    }
+    this.options.onAuthorization?.({ outcome, clientName: client.client_name ?? client.client_id });
   }
 
   /** Read fresh each time. If it cannot be read (broken auth.json, too-short env value), approval is refused. */
@@ -349,15 +346,6 @@ function sameResource(a: URL, b: URL): boolean {
   const normalize = (url: URL) => url.href.replace(/#.*$/, "").replace(/\/$/, "");
 
   return normalize(a) === normalize(b);
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }
 
 function approvalPage(client: OAuthClientInformationFull, params: AuthorizationParams, error?: string): string {

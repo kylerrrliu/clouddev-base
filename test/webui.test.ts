@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { createServer, request, type IncomingHttpHeaders, type Server } from "node:http";
+import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { ActivityLog } from "../src/activity.ts";
 import { textResult } from "../src/tools/common.ts";
-import { createWebUiApp } from "../src/webui.ts";
+import { createWebUiApp, WEBUI_NAME } from "../src/webui.ts";
+import { firstEvent, httpGet, readEvents } from "./helpers.ts";
 
 const INFO = { version: "9.9.9", mcpUrl: "http://127.0.0.1:7676/mcp", allowedRoots: ["/w"] };
 
@@ -25,45 +26,7 @@ after(() => {
   server.close();
 });
 
-/** A plain GET with node:http, which (unlike fetch) can send any Host header. */
-function get(path: string, headers: Record<string, string> = {}): Promise<{ status: number; headers: IncomingHttpHeaders; body: string }> {
-  return new Promise((resolve, reject) => {
-    request(`${base}${path}`, { headers }, (res) => {
-      let body = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk: string) => (body += chunk));
-      res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
-    }).on("error", reject).end();
-  });
-}
-
-/** Read server-sent events until `done` says stop. */
-async function readEvents(response: Response, done: (events: Array<{ type: string } & Record<string, unknown>>) => boolean) {
-  const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
-  const events: Array<{ type: string } & Record<string, unknown>> = [];
-  let buffer = "";
-
-  while (!done(events)) {
-    const { value, done: ended } = await reader.read();
-
-    if (ended) break;
-
-    buffer += value;
-    let end: number;
-
-    while ((end = buffer.indexOf("\n\n")) !== -1) {
-      const block = buffer.slice(0, end);
-      buffer = buffer.slice(end + 2);
-      const data = block.split("\n").find((line) => line.startsWith("data: "));
-
-      if (data) events.push(JSON.parse(data.slice(6)));
-    }
-  }
-
-  await reader.cancel();
-
-  return events;
-}
+const get = (path: string, headers: Record<string, string> = {}) => httpGet(`${base}${path}`, headers);
 
 test("serves the page with a strict content security policy", async () => {
   const page = await get("/");
@@ -73,27 +36,35 @@ test("serves the page with a strict content security policy", async () => {
   assert.match(String(page.headers["content-security-policy"]), /default-src 'none'.*script-src 'self'/);
   assert.equal(page.headers["x-frame-options"], "DENY");
   assert.equal(page.headers["x-powered-by"], undefined);
+  assert.equal(page.headers["cache-control"], "no-store");
 
   assert.match((await get("/app.js")).headers["content-type"] ?? "", /javascript/);
   assert.match((await get("/app.css")).headers["content-type"] ?? "", /text\/css/);
   assert.equal((await get("/nope")).status, 404);
+  assert.equal((await get("/api/snapshot")).status, 404, "the page gets its snapshot from the event stream");
 });
 
 test("refuses other host names (DNS rebinding) and cross-site reads", async () => {
   assert.equal((await get("/", { host: "evil.example" })).status, 403);
-  assert.equal((await get("/api/snapshot", { host: "evil.example:7677" })).status, 403);
-  assert.equal((await get("/api/snapshot", { "sec-fetch-site": "cross-site" })).status, 403);
-  assert.equal((await get("/api/snapshot", { "sec-fetch-site": "same-origin" })).status, 200);
+  assert.equal((await get("/api/health", { host: "evil.example:7677" })).status, 403);
+  assert.equal((await get("/api/health", { "sec-fetch-site": "cross-site" })).status, 403);
+  assert.equal((await get("/api/health", { "sec-fetch-site": "same-origin" })).status, 200);
   assert.equal((await get("/", { host: "localhost" })).status, 200);
+});
+
+test("/api/health names the page and its process", async () => {
+  assert.deepEqual(JSON.parse((await get("/api/health")).body), { name: WEBUI_NAME, pid: process.pid });
 });
 
 test("the snapshot and call details reflect the activity log", async () => {
   const call = activity.startCall({ tool: "edit", summary: "src/a.ts", args: { path: "src/a.ts", edits: [{ old_text: "a", new_text: "b" }] } });
   call.finish(textResult("Edited src/a.ts (+1 -1 lines)."), false);
 
-  const snapshot = JSON.parse((await get("/api/snapshot")).body) as { server: typeof INFO; calls: Array<{ id: number; status: string }> };
+  const snapshot = (await firstEvent(`${base}/api/stream`)) as unknown as { type: string; server: typeof INFO; calls: Array<{ id: number; status: string }>; limits: unknown };
+  assert.equal(snapshot.type, "snapshot");
   assert.deepEqual(snapshot.server, INFO);
   assert.equal(snapshot.calls.find((item) => item.id === call.id)?.status, "ok");
+  assert.ok(snapshot.limits);
 
   const detail = JSON.parse((await get(`/api/calls/${call.id}`)).body) as { args: { edits: unknown[] }; output: string };
   assert.equal(detail.args.edits.length, 1);
@@ -104,6 +75,9 @@ test("the snapshot and call details reflect the activity log", async () => {
 });
 
 test("the event stream starts with a snapshot, then follows calls and their live output", async () => {
+  // Let the server notice that the stream of the previous test was closed.
+  await delay(200);
+
   const controller = new AbortController();
   const response = await fetch(`${base}/api/stream`, { signal: controller.signal });
   assert.equal(response.status, 200);

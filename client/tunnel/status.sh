@@ -3,10 +3,9 @@
 # 用法: client/tunnel/status.sh [日志行数，默认 20]
 set -u
 
-LABEL="com.clouddev-base.tunnel"
-TARGET="gui/$(id -u)/$LABEL"
-CONF="$HOME/.clouddev-tunnel/ssh_config"
-LOG="$HOME/Library/Logs/clouddev-tunnel.log"
+# shellcheck source=common.sh
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/common.sh"
+
 LINES="${1:-20}"
 
 # 本机监听的端口取自 ssh_config 里的 LocalForward 127.0.0.1:<端口> ...
@@ -23,8 +22,12 @@ fi
 
 echo
 printf '经隧道访问 B 上的 clouddev-base（http://127.0.0.1:%s/healthz）: ' "$PORT"
-if curl -fsS -m 5 "http://127.0.0.1:$PORT/healthz" 2>/dev/null | grep -q clouddev-base; then
+listeners="$(port_listeners "$PORT")"
+pid="$(tunnel_pid)"
+if tunnel_up "$PORT"; then
   echo "正常"
+elif [ -n "${listeners// /}" ] && [[ " $listeners" != *" ${pid:-none} "* ]]; then
+  echo "不通：本机 ${PORT} 端口被别的程序占着（pid ${listeners% }），不是隧道"
 else
   echo "不通"
 fi

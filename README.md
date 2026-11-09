@@ -79,7 +79,7 @@ clouddev-base service install
 
 安装后 macOS 会提示“已添加后台项目”。如果在系统设置 → 通用 → 登录项与扩展里关掉了它，launchd 就不会启动服务。不想装后台服务的话，也可以在终端里运行 `clouddev-base serve`。
 
-**4. 让 B 不睡眠。** 系统设置 → 能源（笔记本是电池 → 选项），打开“显示器关闭时防止自动进入睡眠”（笔记本只在接电源时有效）。B 一睡着隧道就会断，直到 B 醒来。
+**4. 让 B 不睡眠。** B 一睡着隧道就会断，直到 B 醒来。后台服务运行期间会用 macOS 自带的 `caffeinate -i` 阻止 B 因为空闲而睡眠，不用改系统设置；但笔记本合上盖子（没接外接显示器时）仍然会睡，这种 B 要开着盖子用。在终端里手动运行 `serve` 时不会阻止睡眠，要么到系统设置 → 能源（笔记本是电池 → 选项）打开“显示器关闭时防止自动进入睡眠”。
 
 **5. 设置 sshd：** 禁止 Unix socket 的反向转发（必须），及时清理死连接、只允许密钥登录（建议）：
 
@@ -101,7 +101,7 @@ macOS 的 sshd 每个连接单独启动，改完对新连接生效。
 
 **6.** 接下来在 A 上运行安装脚本时，它会打印一行公钥，**把那一整行加到 B 上这个账号的 `~/.ssh/authorized_keys`**。以前加过这把钥匙（比如改了端口、重新运行了安装脚本）的话，要把旧的那一行换掉，而不是再追加一行：sshd 只认同一把钥匙的第一行。安装脚本还会打印一条命令，能 ssh 登录 B 的话直接运行它，它会替换旧行，并且不会和文件最后一行粘在一起。
 
-**从 Tailscale 迁移过来：** 在 B 上运行 `tailscale serve reset` 撤掉 Tailscale 的转发，再用上面第 2 步的 `init --public-url http://127.0.0.1:7676` 把访问地址改成回环地址。旧令牌绑定的是 ts.net 地址，会自动失效，在 A 的 Claude Code 里用 `/mcp` 重新认证一次即可。
+**从 Tailscale 迁移过来：** 在 B 上运行 `tailscale serve --https=443 off` 撤掉原来那条转发（也就是旧文档里的 `tailscale serve --bg 7676`；不要用 `tailscale serve reset`，它会清掉 B 上所有 serve 和 funnel 设置。可以先用 `tailscale serve status` 看看有哪些），再用上面第 2 步的 `init --public-url http://127.0.0.1:7676` 把访问地址改成回环地址。旧令牌绑定的是 ts.net 地址，会自动失效，在 A 的 Claude Code 里用 `/mcp` 重新认证一次即可。
 
 ### 在 A（你用来操作的电脑）上
 
@@ -110,15 +110,15 @@ macOS 的 sshd 每个连接单独启动，改完对新连接生效。
 **2. 建隧道：**
 
 ```bash
-client/tunnel/install.sh bob@192.168.1.20
+client/tunnel/install.sh bob@bob-mac.local
 ```
 
-`bob@192.168.1.20` 换成 B 上的账号和 B 的地址（局域网 IP、`b-mac.local` 或公网域名都行；SSH 不是 22 端口时加 `-p 端口`）。脚本会：
+`bob@bob-mac.local` 换成 B 上的账号和 B 的地址（B 上运行 `clouddev-base init` 时会打印它）。在同一个局域网里，最好用 B 的局域网名字（在 B 上运行 `scutil --get LocalHostName`，加上 `.local`），B 的 IP 变了也能连上；写 IP 的话，IP 一变隧道就会一直连不上。不在同一个局域网时用 B 的公网地址或域名；SSH 不是 22 端口时加 `-p 端口`。脚本会：
 
 1. 生成隧道专用密钥 `~/.clouddev-tunnel/id_ed25519`（没有口令，后台运行时才不用等人输入）；
 2. 生成隧道专用的 ssh 配置 `~/.clouddev-tunnel/ssh_config`。你自己要加的设置（比如经中转机的 `ProxyJump`）写在旁边的 `ssh_config.local` 里：脚本不会改它，重新运行也不会覆盖，而且它优先生效；
 3. 打印要加到 B 上 `authorized_keys` 的那一行，等你加好后按回车；
-4. 用新配置第一次连接 B，请你核对 B 的主机指纹（在 B 上运行 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` 查看）。这是唯一一次需要人确认，之后不会再问。同时检查 B 上的限制是否生效；
+4. 用新配置第一次连接 B，请你核对 B 的主机指纹（在 B 上运行 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` 查看）。这是唯一一次需要人确认，之后不会再问。同时检查 B 上的限制是否生效：钥匙不能执行命令，也不能转发到 B 的别的端口；
 5. 确认能连上之后，才换上新的配置、装好 LaunchAgent `~/Library/LaunchAgents/com.clouddev-base.tunnel.plist` 并启动隧道，再确认能经隧道访问 B 上的服务。在这之前失败或按了 Ctrl+C，已经在跑的隧道不受影响。
 
 可以重复运行（比如换了 B 的地址或端口），密钥和已确认的指纹会沿用。加 `--no-load` 只生成文件：不连接 B，也不装进 launchd（登录时不会自动启动）。`client/tunnel/status.sh` 查看状态和日志，`client/tunnel/uninstall.sh` 卸载。
@@ -199,9 +199,11 @@ B 上的服务本身仍然监听 7676。
 几点说明：
 
 - WebUI 只监听 127.0.0.1，A 访问不到：隧道只转发 MCP 端口，A 的钥匙在 B 上也只能连 7676。所以它不需要登录。它还会拒绝别的域名指向它的请求（防 DNS rebinding），也拒绝别的网站跨站读取它的数据。
-- 记录只保存在内存里（最近 500 次调用），不写磁盘，服务重启后清空。`bash` 命令在 WebUI 里显示全文；写进日志文件的仍然只记长度（见“安全须知”）。
+- 记录只保存在内存里（最近 500 次调用），不写磁盘，服务重启后清空。`bash` 命令在 WebUI 里显示全文；写进日志文件的仍然只记长度（见“安全须知”）。参数不对或者工具不存在、服务没有执行的调用也会列出来，标为出错。
+- 已中止只用于真的停下来的调用（`bash`、`grep`、`glob`）。读写文件不会因为取消而停下：客户端取消或断开时它们照样做完，记录里标着“未送达”，表示结果没送到客户端，但文件已经改了。
 - Claude Code 空闲时隧道里没有任何流量，所以 WebUI 看不出隧道是否连着，隧道状态在 A 上用 `status.sh` 看。
-- 端口用 `--ui-port` 或 `init --ui-port` 修改，设为 `0` 关闭。端口被占用时只有 WebUI 不启动，MCP 服务照常运行。
+- 页面切到后台时会断开和服务的连接，切回来时重新同步。浏览器对同一个地址最多同时开 6 个连接，这样开多个标签也不会把它们占满。
+- 端口用 `--ui-port` 或 `init --ui-port` 修改，设为 `0` 关闭（关闭后服务也不再记录调用）。端口被占用时只有 WebUI 不启动，MCP 服务照常运行，每 30 秒重试一次；`clouddev-base service status` 会显示 WebUI 是否正常。
 
 ### A 连不到 B 时（经中转机）
 
@@ -254,7 +256,7 @@ A、B 不在同一个局域网，B 也没有公网地址时，找一台有公网
 5. 交给 launchd 常驻（复用 A 上的启动脚本，日志在 `~/Library/Logs/clouddev-tunnel-clouddev-relay.log`）：
 
    ```bash
-   cp client/tunnel/run.sh ~/.clouddev-tunnel/run.sh
+   cp client/tunnel/run.sh client/tunnel/common.sh ~/.clouddev-tunnel/
    cat > ~/Library/LaunchAgents/com.clouddev-base.relay-tunnel.plist <<EOF
    <?xml version="1.0" encoding="UTF-8"?>
    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -276,7 +278,7 @@ A、B 不在同一个局域网，B 也没有公网地址时，找一台有公网
 
 1. 只生成文件，让隧道连 R 上的 127.0.0.1:2222（也就是 B 的 SSH）：`client/tunnel/install.sh --no-load -p 2222 bob@127.0.0.1`。它打印的那一行照常加到 B 的 `authorized_keys`。
 2. 在 R 的 `authorized_keys` 里也加上 A 的公钥（`~/.clouddev-tunnel/id_ed25519.pub`），前面加 `restrict,port-forwarding,permitopen="127.0.0.1:2222",permitlisten="127.0.0.1:1",command="/usr/bin/false"`。
-3. 把中转设置写进 `~/.clouddev-tunnel/ssh_config.local`。安装脚本不会改这个文件，生成的 `ssh_config` 会在最前面引用它：
+3. 把中转设置写进 `~/.clouddev-tunnel/ssh_config.local`。安装脚本不会改这个文件，生成的 `ssh_config` 会在最前面引用它；专用密钥、指纹检查、不等人输入、心跳这些加固设置写在 `ssh_config` 末尾的 `Host *` 里，对 R 同样生效，这里不用再写：
 
    ```text
    Host clouddev-b
@@ -285,15 +287,6 @@ A、B 不在同一个局域网，B 也没有公网地址时，找一台有公网
    Host clouddev-relay
        HostName r.example.com
        User tunnel
-       IdentityFile ~/.clouddev-tunnel/id_ed25519
-       IdentitiesOnly yes
-       IdentityAgent none
-       UserKnownHostsFile ~/.clouddev-tunnel/known_hosts
-       StrictHostKeyChecking yes
-       BatchMode yes
-       ServerAliveInterval 10
-       ServerAliveCountMax 3
-       ConnectTimeout 10
    ```
 
 4. 确认 R 的指纹，应该以退出码 1 结束（受限的钥匙只会执行 `false`）：
@@ -349,7 +342,7 @@ WantedBy=default.target
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.json` | `allowedRoots`、`port`（默认 7676）、`host`（默认 127.0.0.1）、`publicUrl`（A 上的客户端访问服务用的地址，默认 `http://127.0.0.1:<port>`）、`uiPort`（WebUI 端口，默认 7677，0 关闭）、`allowedRedirectHosts`、`serviceEnv`（见下） |
+| `config.json` | `allowedRoots`、`port`（默认 7676）、`host`（默认 127.0.0.1）、`publicUrl`（A 上的客户端访问服务用的地址，默认 `http://127.0.0.1:<port>`）、`uiPort`（WebUI 端口，默认 7677，0 关闭；`port` 设成 7677 而没设 `uiPort` 时用 7678）、`allowedRedirectHosts`、`serviceEnv`（见下） |
 | `auth.json` | Owner 密码（见下） |
 | `oauth.json` | 已注册的客户端和令牌（令牌只存 SHA-256 哈希） |
 | `workspaces.json` | `workspace_id` 与项目目录的对应关系 |
@@ -374,7 +367,7 @@ WantedBy=default.target
 
   这些前缀只管 TCP 端口，管不到 Unix socket 的反向转发（`ssh -R /路径.sock:…`，能在 B 上任意可写的位置放一个 socket，把 B 上程序的连接转给对方），所以 B 的 sshd 还要设置 `AllowStreamLocalForwarding local`（“在 B 上”第 5 步）。两样都做了，这把钥匙即使被偷，也只能碰到 7676，而 7676 还要 OAuth 令牌和 Owner 密码。不要去掉这些限制，也不要把它加到能做别的事的账号设置里。
 - 不要把 7676 端口直接开放到网络上（改 `--host`、做端口映射，或者用 cloudflared、ngrok、`tailscale funnel` 之类的工具），那样挡住别人的就只剩 Owner 密码和授权令牌了。B 的 SSH 端口要暴露到公网时，按“在 B 上”第 5 步只允许密钥登录。
-- 服务端日志（终端里，或后台服务的 `~/Library/Logs/clouddev-base.log`）逐行记录每次工具调用（工具名、文件路径或搜索模式、耗时）。命令里可能带密钥，所以 `bash` 默认只记录命令长度；想看到完整命令，启动前设置环境变量 `CLOUDDEV_BASE_LOG_COMMANDS=1`（`service install` 会把它带进后台服务）。
+- 服务端日志（终端里，或后台服务的 `~/Library/Logs/clouddev-base.log`）逐行记录每次工具调用（工具名、文件路径或搜索模式、耗时）。命令里可能带密钥，所以 `bash` 默认只记录命令长度；想看到完整命令，启动前设置环境变量 `CLOUDDEV_BASE_LOG_COMMANDS=1`（`service install` 会把它带进后台服务，并提示你）。后台服务的日志超过 10MB 时，旧的内容挪到 `clouddev-base.log.1`（只留一份）；服务自动生成 Owner 密码时也不会把它写进日志。
 - WebUI 只监听 127.0.0.1，在 B 本机才能打开。里面的命令全文只保存在内存里，不写磁盘。
 
 ## 排错
@@ -382,7 +375,8 @@ WantedBy=default.target
 - **先分段确认是通的。** 在 B 上运行 `curl http://127.0.0.1:7676/healthz`，再在 A 上运行同一条命令。两边都应该返回 `{"ok":true,"name":"clouddev-base","pid":…}`，而且 `pid` 相同：
   - B 本机就不通，问题在服务上：运行 `clouddev-base service status`，看 `~/Library/Logs/clouddev-base.log`；
   - B 通、A 不通，问题在隧道上：在 A 上运行 `client/tunnel/status.sh`。
-- **隧道日志里反复出现 `Timeout, server … not responding.` 或 `connect to host … timed out`**：A 连不到 B。检查 B 是否睡着了、地址是否变了（换了地址就重新运行 `install.sh`），以及 B 的远程登录是否打开。
+- **隧道日志里反复出现 `Timeout, server … not responding.` 或 `connect to host … timed out`**：A 连不到 B。检查 B 是否睡着了、地址是否变了（换了地址就重新运行 `install.sh`，在局域网里最好改用 B 的 `.local` 名字），以及 B 的远程登录是否打开。
+- **`status.sh` 说本机端口被别的程序占着**：A 上有别的程序（比如在 A 上也运行了 `clouddev-base serve`）占着隧道要用的端口，隧道绑不上它。停掉那个程序，或者三处一起换一个端口（见“在 A 上”第 3 步后面的说明）。
 - **`Permission denied (publickey)`**：B 上的 `authorized_keys` 里没有那一行，或者账号不对；`install.sh` 打印的那一行也保存在 `~/.clouddev-tunnel/authorized_keys_line.txt`。
 - **`Host key verification failed`**：B 的主机指纹变了（重装了系统，或者换了一台 B）。确认是你自己的 B 后，删掉旧指纹 `ssh-keygen -R clouddev-b -f ~/.clouddev-tunnel/known_hosts`，再运行一次 `install.sh`。
 - **`administratively prohibited`**：B 上 `authorized_keys` 那一行的 `permitopen` 端口和 B 上服务的端口不一致；或者这把钥匙在 `authorized_keys` 里有不止一行（比如改端口后又追加了一行），sshd 只认第一行，删掉旧的。
@@ -413,6 +407,7 @@ src/
   webui.ts          WebUI 服务：只监听 127.0.0.1，页面 + SSE 事件流
   webui/            WebUI 页面（纯 HTML/CSS/JS，不需要构建）
   service.ts        macOS 后台服务（launchd）：生成 plist、加载、卸载、查看状态
+  markup.ts         HTML/XML 转义（授权页和 plist 共用）
   workspaces.ts     工作区注册与允许目录校验
   paths.ts          路径解析与越界防护（含符号链接）
   version.ts        版本号
@@ -429,5 +424,5 @@ client/             在电脑 A 上启动 Claude Code 用的目录（见“用�
   .claude/settings.json
   .mcp.json
   CLAUDE.md
-  tunnel/           A 上的 SSH 隧道：install.sh / run.sh / status.sh / uninstall.sh
+  tunnel/           A 上的 SSH 隧道：install.sh / run.sh / status.sh / uninstall.sh，共用的路径和检查在 common.sh
 ```

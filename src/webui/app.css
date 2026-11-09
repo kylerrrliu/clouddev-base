@@ -228,7 +228,7 @@ pre.live { max-height: 220px; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.row.is-cancelled .brief { color: var(--stopped); }
+.row.is-cancelled .brief, .brief-quiet { color: var(--stopped); }
 
 @media (max-width: 640px) {
   .row > summary { grid-template-columns: auto minmax(0, 1fr) auto; }

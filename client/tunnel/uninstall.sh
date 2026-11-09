@@ -4,18 +4,19 @@
 #   --purge  连同 ~/.clouddev-tunnel（密钥、配置、B 的指纹）一起删除
 set -u
 
-LABEL="com.clouddev-base.tunnel"
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-DIR="$HOME/.clouddev-tunnel"
+# shellcheck source=common.sh
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/common.sh"
 
-if launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+if launchctl bootout "$TARGET" >/dev/null 2>&1; then
   echo "已停止隧道。"
 else
   echo "隧道没有在运行。"
 fi
 
-rm -f "$PLIST"
-echo "已移除 ${PLIST}。"
+if [ -f "$PLIST" ]; then
+  rm -f "$PLIST"
+  echo "已移除 ${PLIST}。"
+fi
 
 if [ "${1:-}" = "--purge" ]; then
   rm -rf "$DIR"

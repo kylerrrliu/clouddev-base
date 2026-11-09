@@ -3,12 +3,14 @@ import { formatSize, type ToolResult } from "./tools/common.ts";
 
 /** Tool calls the activity page keeps. Running calls are never dropped. */
 export const MAX_CALLS = 500;
-const MAX_NOTICES = 200;
+export const MAX_NOTICES = 200;
 /** Longest string kept from a tool argument: an edit's old/new text, a written file, a command. */
 const MAX_ARG_CHARS = 8 * 1024;
+/** Items kept from an array argument (the edits of an `edit`). */
+const MAX_ARG_ITEMS = 100;
 /** Result text kept per finished call. */
 export const MAX_RESULT_CHARS = 16 * 1024;
-/** Live output kept per running call (only bash streams output). */
+/** Live output shown per running call (only bash streams output): the end of it. */
 export const MAX_LIVE_OUTPUT_CHARS = 64 * 1024;
 /** Live output is pushed to viewers at most this often. */
 const OUTPUT_FLUSH_MS = 250;
@@ -16,6 +18,12 @@ const OUTPUT_FLUSH_MS = 250;
 const REQUEST_EVENT_INTERVAL_MS = 1000;
 const MAX_BRIEF_CHARS = 200;
 const MAX_SUMMARY_CHARS = 500;
+
+/** What the page keeps, so it can match the server. */
+export interface ActivityLimits {
+  calls: number;
+  notices: number;
+}
 
 export type CallStatus = "running" | "ok" | "error" | "cancelled";
 
@@ -34,6 +42,11 @@ export interface CallSummary {
   status: CallStatus;
   /** For finished calls, the most telling line of the result (the last one for bash). */
   brief?: string;
+  /**
+   * The client cancelled the call or went away while it ran, but this tool does not stop for that
+   * (read, write, edit, open_workspace): the work was done, the result just never reached the client.
+   */
+  undelivered?: boolean;
 }
 
 /** A call with its (truncated) arguments and output, fetched when a row is expanded. */
@@ -68,12 +81,13 @@ export interface ActivitySnapshot {
   /** Output so far of the calls still running, by call id. */
   live: Record<number, string>;
   notices: Notice[];
+  limits: ActivityLimits;
 }
 
 export type ActivityEvent =
   | { type: "call.start"; call: CallSummary }
-  /** `replace`: the text is the whole output so far, not an addition (more arrived than one event carries). */
-  | { type: "call.output"; id: number; text: string; replace: boolean }
+  /** The output so far of a running call (its end, when long). It replaces what was shown before. */
+  | { type: "call.output"; id: number; text: string }
   | { type: "call.end"; call: CallSummary }
   | { type: "notice"; notice: Notice }
   | { type: "client"; client: ClientInfo }
@@ -85,6 +99,8 @@ export interface StartCall {
   args: Record<string, unknown>;
   workspace?: string;
   client?: string;
+  /** The tool stops when the client cancels (bash, grep, glob). Others run to completion regardless. */
+  cancellable?: boolean;
 }
 
 /** Handle for a call in progress. */
@@ -96,10 +112,17 @@ export interface ActiveCall {
   finish(result: ToolResult, aborted: boolean): void;
 }
 
-interface CallRecord extends CallDetail {
-  /** Output not yet pushed to viewers. */
-  pending: string;
-  pendingReplace: boolean;
+interface CallRecord extends CallSummary {
+  args: Record<string, unknown>;
+  cancellable: boolean;
+  /**
+   * While running, the live output: it may grow to twice the shown length before it is cut back, so a chunk
+   * costs no more than appending it. Once finished, the kept result text.
+   */
+  text: string;
+  /** Some output was cut off. */
+  cut: boolean;
+  /** A batch of live output is waiting to be pushed. */
   flushTimer?: NodeJS.Timeout;
 }
 
@@ -143,14 +166,7 @@ export class ActivityLog {
     const live: Record<number, string> = {};
 
     for (const call of this.calls) {
-      if (call.status !== "running") continue;
-
-      // Text still waiting in `pending` reaches every subscriber with the next batch, so it is left out here:
-      // a viewer that takes this snapshot and then subscribes would otherwise get it twice. (In append mode
-      // `pending` is always the end of `output`; a replace batch carries everything anyway.)
-      const shown = call.pendingReplace ? call.output : call.output.slice(0, call.output.length - call.pending.length);
-
-      if (shown) live[call.id] = shown;
+      if (call.status === "running" && call.text) live[call.id] = liveOutput(call);
     }
 
     return {
@@ -160,6 +176,7 @@ export class ActivityLog {
       calls: this.calls.map(summaryOf),
       live,
       notices: [...this.notices],
+      limits: { calls: MAX_CALLS, notices: MAX_NOTICES },
     };
   }
 
@@ -196,35 +213,14 @@ export class ActivityLog {
     this.emit({ type: "notice", notice });
   }
 
-  startCall({ tool, summary, args, workspace, client }: StartCall): ActiveCall {
-    const record: CallRecord = {
-      id: this.nextCallId++,
-      tool,
-      summary: oneLine(summary),
-      workspace,
-      client,
-      startedAt: Date.now(),
-      status: "running",
-      args: clipArgs(args),
-      output: "",
-      outputTruncated: false,
-      pending: "",
-      pendingReplace: false,
-    };
-
-    this.calls.push(record);
-    this.dropOldCalls();
+  startCall(call: StartCall): ActiveCall {
+    const record = this.add(call);
     this.emit({ type: "call.start", call: summaryOf(record) });
 
     const flush = () => {
       record.flushTimer = undefined;
 
-      if (!record.pending && !record.pendingReplace) return;
-
-      const event: ActivityEvent = { type: "call.output", id: record.id, text: record.pending, replace: record.pendingReplace };
-      record.pending = "";
-      record.pendingReplace = false;
-      this.emit(event);
+      if (record.status === "running") this.emit({ type: "call.output", id: record.id, text: liveOutput(record) });
     };
 
     return {
@@ -232,21 +228,11 @@ export class ActivityLog {
       output: (text) => {
         if (record.status !== "running" || !text) return;
 
-        const combined = record.output + text;
+        record.text += text;
 
-        if (combined.length > MAX_LIVE_OUTPUT_CHARS) {
-          record.output = combined.slice(-MAX_LIVE_OUTPUT_CHARS);
-          record.outputTruncated = true;
-        } else {
-          record.output = combined;
-        }
-
-        record.pending += text;
-
-        // More than one event should carry: send the kept tail as a replacement instead.
-        if (record.pending.length > MAX_LIVE_OUTPUT_CHARS) {
-          record.pending = record.output;
-          record.pendingReplace = true;
+        if (record.text.length > 2 * MAX_LIVE_OUTPUT_CHARS) {
+          record.text = own(record.text.slice(-MAX_LIVE_OUTPUT_CHARS));
+          record.cut = true;
         }
 
         if (!record.flushTimer) {
@@ -259,22 +245,51 @@ export class ActivityLog {
 
         clearTimeout(record.flushTimer);
         record.flushTimer = undefined;
-        record.pending = "";
-        record.pendingReplace = false;
 
-        const text = resultText(result);
+        // A tool that stops when cancelled was cancelled; one that ran to completion keeps its own outcome.
+        record.status = aborted && record.cancellable ? "cancelled" : result.isError ? "error" : "ok";
+        if (aborted && !record.cancellable) record.undelivered = true;
         // bash already keeps the end of long output, and its last lines carry the exit status.
-        const keepTail = record.tool === "bash";
-
-        record.status = aborted ? "cancelled" : result.isError ? "error" : "ok";
-        record.endedAt = Date.now();
-        record.output = own(keepTail ? clipTail(text, MAX_RESULT_CHARS) : clipHead(text, MAX_RESULT_CHARS));
-        record.outputTruncated = record.output.length < text.length;
-        const brief = briefOf(text, keepTail);
-        record.brief = brief === undefined ? undefined : own(brief);
-        this.emit({ type: "call.end", call: summaryOf(record) });
+        this.end(record, resultText(result), record.tool === "bash");
       },
     };
+  }
+
+  /** A call the server refused before running it: arguments that do not fit the tool, or an unknown tool. */
+  rejectedCall({ tool, args, client, message }: { tool: string; args: Record<string, unknown>; client?: string; message: string }): void {
+    const record = this.add({ tool, summary: summaryFromArgs(args), args, client });
+    record.status = "error";
+    this.end(record, message, false);
+  }
+
+  private add({ tool, summary, args, workspace, client, cancellable = false }: StartCall): CallRecord {
+    const record: CallRecord = {
+      id: this.nextCallId++,
+      tool,
+      summary: oneLine(summary),
+      workspace,
+      client,
+      startedAt: Date.now(),
+      status: "running",
+      args: clipArgs(args),
+      cancellable,
+      text: "",
+      cut: false,
+    };
+
+    this.calls.push(record);
+    this.dropOldCalls();
+
+    return record;
+  }
+
+  private end(record: CallRecord, text: string, keepTail: boolean): void {
+    record.endedAt = Date.now();
+    record.text = own(keepTail ? clipTail(text, MAX_RESULT_CHARS) : clipHead(text, MAX_RESULT_CHARS));
+    record.cut = record.text.length < text.length;
+    const brief = briefOf(text, keepTail);
+    record.brief = brief === undefined ? undefined : own(brief);
+    this.emit({ type: "call.end", call: summaryOf(record) });
   }
 
   private dropOldCalls(): void {
@@ -293,15 +308,21 @@ export class ActivityLog {
 }
 
 function summaryOf(call: CallRecord): CallSummary {
-  const { id, tool, summary, workspace, client, startedAt, endedAt, status, brief } = call;
+  const { id, tool, summary, workspace, client, startedAt, endedAt, status, brief, undelivered } = call;
 
-  return { id, tool, summary, workspace, client, startedAt, endedAt, status, brief };
+  return { id, tool, summary, workspace, client, startedAt, endedAt, status, brief, undelivered };
 }
 
 function detailOf(call: CallRecord): CallDetail {
-  const { args, output, outputTruncated } = call;
+  const running = call.status === "running";
+  const output = running ? liveOutput(call) : call.text;
 
-  return { ...summaryOf(call), args, output, outputTruncated };
+  return { ...summaryOf(call), args: call.args, output, outputTruncated: call.cut || output.length < call.text.length };
+}
+
+/** What viewers see of a running call's output: its last MAX_LIVE_OUTPUT_CHARS characters. */
+function liveOutput(call: CallRecord): string {
+  return clipTail(call.text, MAX_LIVE_OUTPUT_CHARS);
 }
 
 /** The text of a tool result; images are described instead of included. */
@@ -313,6 +334,15 @@ function resultText(result: ToolResult): string {
     .join("\n");
 }
 
+/** What a refused call was about, from whichever of its usual arguments it has. */
+function summaryFromArgs(args: Record<string, unknown>): string {
+  for (const name of ["command", "pattern", "path"]) {
+    if (typeof args[name] === "string") return args[name];
+  }
+
+  return "";
+}
+
 function briefOf(text: string, last: boolean): string | undefined {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const line = last ? lines.at(-1) : lines[0];
@@ -320,7 +350,7 @@ function briefOf(text: string, last: boolean): string | undefined {
   return line === undefined ? undefined : clipHead(line, MAX_BRIEF_CHARS);
 }
 
-/** Arguments with long strings cut, so one big `write` cannot bloat the page. */
+/** Arguments with long strings and arrays cut, so one big `write` cannot bloat the page. */
 function clipArgs(args: Record<string, unknown>): Record<string, unknown> {
   return clipValue(args, 0) as Record<string, unknown>;
 }
@@ -330,13 +360,14 @@ function clipValue(value: unknown, depth: number): unknown {
     return value.length > MAX_ARG_CHARS ? own(`${value.slice(0, MAX_ARG_CHARS)}\n…（后面还有 ${value.length - MAX_ARG_CHARS} 个字符）`) : value;
   }
 
-  if (Array.isArray(value)) return value.slice(0, 100).map((item) => clipValue(item, depth + 1));
+  if (value === null || typeof value !== "object") return value;
 
-  if (value && typeof value === "object" && depth < 4) {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, clipValue(item, depth + 1)]));
-  }
+  // The tools' arguments are shallow; anything deeper is not shown rather than kept whole.
+  if (depth >= 4) return "…";
 
-  return value;
+  if (Array.isArray(value)) return value.slice(0, MAX_ARG_ITEMS).map((item) => clipValue(item, depth + 1));
+
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, clipValue(item, depth + 1)]));
 }
 
 /**

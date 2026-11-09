@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
-import { createServer, type Server } from "node:http";
-import { homedir } from "node:os";
+import { spawn, spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, statSync, truncateSync } from "node:fs";
+import { createServer, type RequestListener, type Server } from "node:http";
+import { homedir, hostname, userInfo } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -16,15 +17,16 @@ import {
   normalizePublicUrl,
   ownerPasswordPath,
   readStoredConfig,
+  WEBUI_HOST,
   writeStoredConfig,
   type ConfigOverrides,
   type StoredConfig,
 } from "./config.ts";
 import { configureHttpServer, createHttpApp } from "./http.ts";
 import { expandHome } from "./paths.ts";
-import { installService, serviceStatus, uninstallService } from "./service.ts";
+import { installService, SERVICE_ENV_MARKER, SERVICE_LABEL, servicePaths, serviceStatus, uninstallService } from "./service.ts";
 import { VERSION } from "./version.ts";
-import { createWebUiApp, WEBUI_HOST } from "./webui.ts";
+import { createWebUiApp } from "./webui.ts";
 import { WorkspaceRegistry } from "./workspaces.ts";
 
 const HELP = `clouddev-base ${VERSION} — 让 Claude 等 AI 通过 MCP 读写、搜索本机项目并执行命令
@@ -114,12 +116,11 @@ function init(overrides: ConfigOverrides, resetPassword: boolean): void {
     ...(overrides.host ? { host: overrides.host } : {}),
   };
 
-  // Check the result before saving, so a bad combination (say, the same port twice) never reaches config.json.
-  loadConfig({ roots: next.allowedRoots, host: next.host, port: next.port, uiPort: next.uiPort, publicUrl: next.publicUrl });
+  // Checked before saving, so a bad combination (say, the same port twice) never reaches config.json.
+  const config = loadConfig({ roots: next.allowedRoots, host: next.host, port: next.port, uiPort: next.uiPort, publicUrl: next.publicUrl });
   writeStoredConfig(home, next);
 
   const ownerPassword = ensureOwnerPassword(home, resetPassword);
-  const config = loadConfig();
   const mcpUrl = new URL("/mcp", config.publicUrl).href;
 
   console.log(`配置已保存: ${configPath(home)}
@@ -133,10 +134,18 @@ ${missingRootsWarning(config.allowedRoots)}
      或者在终端里临时运行:
        clouddev-base serve
   2. ${isLocalUrl(config.publicUrl)
-    ? `在另一台电脑（A）上运行 client/tunnel/install.sh 建立 SSH 隧道，
+    ? `在另一台电脑（A）上运行 client/tunnel/install.sh ${sshTarget()} 建立 SSH 隧道
+     （这是这台电脑在局域网里的名字，IP 变了也能用；不在同一个局域网时换成能连到这里的地址），
      再把 A 上 client/.mcp.json 的地址设为 ${mcpUrl}（见 README 的“用法”）`
     : `客户端连接地址: ${mcpUrl}
      填进另一台电脑上的 client/.mcp.json，在 client/ 目录里运行 claude，再用 /mcp 认证`}`);
+}
+
+/** user@name A's install.sh can use to reach this computer: its Bonjour name, which survives a new IP address. */
+function sshTarget(): string {
+  const local = process.platform === "darwin" ? spawnSync("scutil", ["--get", "LocalHostName"], { encoding: "utf8" }).stdout?.trim() : undefined;
+
+  return `${userInfo().username}@${local ? `${local}.local` : hostname()}`;
 }
 
 function isLocalUrl(url: string): boolean {
@@ -145,15 +154,22 @@ function isLocalUrl(url: string): boolean {
 
 async function serve(overrides: ConfigOverrides): Promise<void> {
   const config = loadConfig(overrides);
+  const asService = process.env[SERVICE_ENV_MARKER] === SERVICE_LABEL;
+
+  if (asService) keepServiceLogSmall();
 
   // The server reads the password again on every approval; here we only make sure one exists
   // (and fail fast on a too-short CLOUDDEV_BASE_PASSWORD).
   if (!loadOwnerPassword(config.homeDir)) {
     const ownerPassword = ensureOwnerPassword(config.homeDir);
-    console.log(`已生成 Owner 密码: ${ownerPassword}（保存在 ${ownerPasswordPath(config.homeDir)}）`);
+    // Without a terminal (the background service), stdout goes to a log file, where the password must not end up.
+    console.log(process.stdout.isTTY
+      ? `已生成 Owner 密码: ${ownerPassword}（保存在 ${ownerPasswordPath(config.homeDir)}）`
+      : `已生成 Owner 密码，保存在 ${ownerPasswordPath(config.homeDir)}；运行 clouddev-base password 查看。`);
   }
 
-  const activity = new ActivityLog();
+  // The activity log only feeds the WebUI: with the page turned off, calls are not recorded at all.
+  const activity = config.uiPort !== 0 ? new ActivityLog() : undefined;
   const registry = new WorkspaceRegistry(config.allowedRoots, config.homeDir);
   const { app, mcpUrl } = createHttpApp({ config, registry, activity });
   const httpServer = configureHttpServer(createServer(app));
@@ -162,37 +178,110 @@ async function serve(overrides: ConfigOverrides): Promise<void> {
     throw error.code === "EADDRINUSE" ? new Error(`端口 ${config.port} 已被占用，可用 --port 换一个端口。`) : error;
   });
 
-  // The activity page is a convenience: if it cannot start, the MCP service keeps running.
-  let uiServer: Server | undefined;
-  let uiStatus = "已关闭（--ui-port 0）";
-
-  if (config.uiPort !== 0) {
-    try {
-      const server = createServer(createWebUiApp(activity, { version: VERSION, mcpUrl: mcpUrl.href, allowedRoots: config.allowedRoots }));
-      await listen(server, config.uiPort, WEBUI_HOST);
-      uiServer = server;
-      uiStatus = `http://${WEBUI_HOST}:${config.uiPort}（只能在这台电脑上打开）`;
-    } catch (error) {
-      const { code, message } = error as NodeJS.ErrnoException;
-      uiStatus = `没有启动: ${code === "EADDRINUSE" ? `端口 ${config.uiPort} 已被占用，可用 --ui-port 换一个` : message}`;
-    }
-  }
-
+  const ui = activity
+    ? await startWebUi(createWebUiApp(activity, { version: VERSION, mcpUrl: mcpUrl.href, allowedRoots: config.allowedRoots }), config.uiPort)
+    : undefined;
+  const awake = asService && preventIdleSleep();
   const tunnelPort = new URL(config.publicUrl).port || "80";
 
   console.log(`clouddev-base ${VERSION} 已启动
   监听:        http://${config.host}:${config.port}
   MCP 地址:    ${mcpUrl.href}
-  WebUI:       ${uiStatus}
+  WebUI:       ${ui?.status ?? "已关闭（--ui-port 0）"}
   允许的目录:  ${config.allowedRoots.join(", ")}
-  Owner 密码:  运行 clouddev-base password 查看
+  Owner 密码:  运行 clouddev-base password 查看${awake ? "\n  防止休眠:    服务运行期间，这台电脑不会因为空闲而睡眠（caffeinate）" : ""}
 ${missingRootsWarning(config.allowedRoots)}
 ${isLocalUrl(config.publicUrl)
     ? `另一台电脑（A）经 SSH 隧道把它的 127.0.0.1:${tunnelPort} 转发到这里的 ${config.port} 端口，A 上 client/.mcp.json 填上面的 MCP 地址。`
     : "其他电脑上的客户端连接上面的 MCP 地址。"}
 ${process.stdout.isTTY ? "按 Ctrl+C 停止。" : ""}工具调用会显示在下面:`);
 
-  await stopOnSignal([httpServer, ...(uiServer ? [uiServer] : [])]);
+  await stopOnSignal(httpServer, () => ui?.stop());
+}
+
+const UI_RETRY_MS = 30_000;
+
+/**
+ * Start the activity page. It is a convenience: when its port is taken, MCP runs without it, and the page is
+ * tried again every 30 seconds, so it comes up once the port is free.
+ */
+async function startWebUi(app: RequestListener, port: number): Promise<{ status: string; stop(): void }> {
+  const server = createServer(app);
+  const url = `http://${WEBUI_HOST}:${port}`;
+  let retry: NodeJS.Timeout | undefined;
+  let listening = false;
+
+  const attempt = async (first: boolean): Promise<string> => {
+    try {
+      await listen(server, port, WEBUI_HOST);
+      listening = true;
+
+      if (!first) console.error(`WebUI 已启动: ${url}`);
+
+      return `${url}（只能在这台电脑上打开）`;
+    } catch (error) {
+      const { code, message } = error as NodeJS.ErrnoException;
+
+      if (code !== "EADDRINUSE") return `没有启动: ${message}`;
+
+      retry = setTimeout(() => void attempt(false), UI_RETRY_MS);
+      retry.unref();
+
+      return `端口 ${port} 被占用，每 30 秒重试一次（也可以用 --ui-port 换一个端口）`;
+    }
+  };
+
+  const status = await attempt(true);
+
+  return {
+    status,
+    stop: () => {
+      clearTimeout(retry);
+
+      if (!listening) return;
+
+      server.close();
+      server.closeAllConnections();
+    },
+  };
+}
+
+/**
+ * Keep this computer from idle sleep while the background service runs, so the other computer can still reach
+ * it when nobody uses this one. (A closed laptop lid still sleeps.) caffeinate -w lets go when this process ends.
+ */
+function preventIdleSleep(): boolean {
+  if (process.platform !== "darwin" || !existsSync("/usr/bin/caffeinate")) return false;
+
+  const child = spawn("/usr/bin/caffeinate", ["-i", "-w", String(process.pid)], { stdio: "ignore" });
+  child.on("error", (error) => console.error("caffeinate 没能启动:", error.message));
+  child.unref();
+
+  return true;
+}
+
+const SERVICE_LOG_LIMIT = 10 * 1024 * 1024;
+
+/**
+ * launchd appends the service's output to one log file forever. Every 10 minutes a log over 10 MB is copied to
+ * <log>.1 and emptied in place; launchd opened it for appending, so the service just continues at the new end.
+ */
+function keepServiceLogSmall(): void {
+  const { logPath } = servicePaths(homedir());
+
+  const check = () => {
+    try {
+      if (statSync(logPath).size <= SERVICE_LOG_LIMIT) return;
+
+      copyFileSync(logPath, `${logPath}.1`);
+      truncateSync(logPath, 0);
+    } catch {
+      // No log yet, or it cannot be touched: nothing to do.
+    }
+  };
+
+  check();
+  setInterval(check, 10 * 60 * 1000).unref();
 }
 
 function listen(server: Server, port: number, host: string): Promise<void> {
@@ -206,19 +295,14 @@ function listen(server: Server, port: number, host: string): Promise<void> {
   });
 }
 
-/** Resolve once SIGINT or SIGTERM has closed every server. Open connections, including WebUI event streams, are cut. */
-function stopOnSignal(servers: Server[]): Promise<void> {
+/** Resolve once SIGINT or SIGTERM has closed the server. Open connections are cut; `alsoStop` ends the rest. */
+function stopOnSignal(server: Server, alsoStop: () => void): Promise<void> {
   return new Promise((resolvePromise) => {
     const shutdown = () => {
       console.log("\n正在停止…");
-      let open = servers.length;
-
-      for (const server of servers) {
-        server.close(() => {
-          if (--open === 0) resolvePromise();
-        });
-        server.closeAllConnections();
-      }
+      alsoStop();
+      server.close(() => resolvePromise());
+      server.closeAllConnections();
     };
 
     process.once("SIGINT", shutdown);

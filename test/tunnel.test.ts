@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -55,6 +58,7 @@ test("install.sh writes a key, a locked-down ssh config and a launchd job it doe
   assert.equal((await stat(dir)).mode & 0o777, 0o700);
   assert.equal((await stat(join(dir, "id_ed25519"))).mode & 0o777, 0o600);
   assert.equal((await stat(join(dir, "run.sh"))).mode & 0o777, 0o700);
+  assert.equal((await stat(join(dir, "common.sh"))).mode & 0o777, 0o600, "run.sh reads the shared paths from next to it");
   assert.equal((await stat(join(dir, "ssh_config.local"))).mode & 0o777, 0o600);
 
   // The job is prepared, but only copied into LaunchAgents (which launchd loads at every login) once B answered.
@@ -87,7 +91,7 @@ test("settings in ssh_config.local survive re-runs and come first", { skip }, as
   const home = await tempDir();
   const dir = join(home, ".clouddev-tunnel");
   await install(home, "-p", "2222", "bob@127.0.0.1");
-  await appendFile(join(dir, "ssh_config.local"), "Host clouddev-b\n    ProxyJump clouddev-relay\n\nHost clouddev-relay\n    HostName r.example.com\n");
+  await appendFile(join(dir, "ssh_config.local"), "Host clouddev-b\n    ProxyJump clouddev-relay\n\nHost clouddev-relay\n    HostName r.example.com\n    User tunnel\n");
 
   await install(home, "--local-port", "7777", "-p", "2222", "bob@127.0.0.1");
 
@@ -97,6 +101,11 @@ test("settings in ssh_config.local survive re-runs and come first", { skip }, as
   assert.match(stdout, /^localforward \[127\.0\.0\.1\]:7777 \[127\.0\.0\.1\]:7676$/m);
   const relay = await run("ssh", ["-G", "-F", join(dir, "ssh_config"), "clouddev-relay"]);
   assert.match(relay.stdout, /^hostname r\.example\.com$/m);
+  // The relay gets the same hardening from the "Host *" defaults without repeating them.
+  assert.match(relay.stdout, /^identityagent none$/m);
+  assert.match(relay.stdout, /^batchmode yes$/m);
+  assert.match(relay.stdout, /^serveraliveinterval 10$/m);
+  assert.match(relay.stdout, new RegExp(`^identityfile ${join(dir, "id_ed25519").replaceAll(".", "\\.")}$`, "m"));
 });
 
 test("the command printed for B replaces this key's old line and keeps every other key", { skip }, async () => {
@@ -129,16 +138,21 @@ test("the command printed for B replaces this key's old line and keeps every oth
 });
 
 test("status.sh and uninstall.sh --purge run to the end in a UTF-8 locale", { skip }, async () => {
+  // Something else (say, a clouddev-base run on A itself) listens on the tunnel's port.
+  const squatter = createServer((_req, res) => res.end('{"ok":true,"name":"clouddev-base"}')).listen(0, "127.0.0.1");
+  await once(squatter, "listening");
+  const port = String((squatter.address() as AddressInfo).port);
   const home = await tempDir();
-  await install(home, "bob@192.168.1.20");
+  await install(home, "--local-port", port, "bob@192.168.1.20");
 
   // A launchctl that knows no jobs, so nothing here reaches the real launchd.
   const bin = await tempDir();
   await writeFile(join(bin, "launchctl"), "#!/bin/sh\nexit 113\n", { mode: 0o755 });
   const env = { ...process.env, ...UTF8, HOME: home, PATH: `${bin}:${process.env.PATH}` };
 
-  const status = await run(join(TUNNEL, "status.sh"), [], { env });
+  const status = await run(join(TUNNEL, "status.sh"), [], { env }).finally(() => squatter.close());
   assert.match(status.stdout, /没有加载/);
+  assert.match(status.stdout, /被别的程序占着/, "an answer on the port is not taken for the tunnel");
   assert.match(status.stdout, /立即重连/);
 
   const uninstall = await run(join(TUNNEL, "uninstall.sh"), ["--purge"], { env });
@@ -147,7 +161,7 @@ test("status.sh and uninstall.sh --purge run to the end in a UTF-8 locale", { sk
 });
 
 test("the tunnel scripts never put a non-ASCII character right after $NAME", async () => {
-  for (const file of ["install.sh", "run.sh", "status.sh", "uninstall.sh"]) {
+  for (const file of ["install.sh", "run.sh", "status.sh", "uninstall.sh", "common.sh"]) {
     const lines = (await readFile(join(TUNNEL, file), "utf8")).split("\n");
     const bad = lines.flatMap((line, index) => (/\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/u.test(line) ? [`${file}:${index + 1}: ${line.trim()}`] : []));
 

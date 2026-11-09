@@ -7,7 +7,7 @@ import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { tempDir } from "./helpers.ts";
+import { firstEvent, tempDir } from "./helpers.ts";
 
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
@@ -138,7 +138,7 @@ test("serve also starts the WebUI, on 127.0.0.1 only", async () => {
   assert.equal(page.status, 200);
   assert.match(await page.text(), /clouddev-base/);
 
-  const snapshot = (await (await fetch(`${uiBase}/api/snapshot`)).json()) as { server: { mcpUrl: string } };
+  const snapshot = (await firstEvent(`${uiBase}/api/stream`)) as unknown as { server: { mcpUrl: string } };
   assert.equal(snapshot.server.mcpUrl, `${base}/mcp`);
 });
 
@@ -180,4 +180,38 @@ test("password says when it shows CLOUDDEV_BASE_PASSWORD rather than auth.json",
   assert.equal(stdout.trim(), "from-the-environment-123");
   assert.match(stderr, /CLOUDDEV_BASE_PASSWORD/);
   assert.match(stderr, /auth\.json/);
+});
+
+test("init says what to pass to install.sh on the other computer", async () => {
+  const { stdout } = await cli("init", "--root", await tempDir());
+
+  assert.match(stdout, /client\/tunnel\/install\.sh \S+@\S+/);
+});
+
+test("serve runs MCP without the WebUI while its port is taken, and says it will retry", async () => {
+  const busy = createServer().listen(0, "127.0.0.1");
+  await once(busy, "listening");
+  const uiPort = (busy.address() as AddressInfo).port;
+  const port = await freePort();
+  let text = "";
+  const child = spawn(process.execPath, [CLI, "serve", "--root", await tempDir(), "--port", String(port), "--ui-port", String(uiPort)], { env, stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout?.on("data", (chunk) => (text += chunk));
+  child.stderr?.on("data", (chunk) => (text += chunk));
+
+  try {
+    const deadline = Date.now() + 15_000;
+
+    while (!/工具调用会显示在下面/.test(text)) {
+      if (child.exitCode !== null || Date.now() > deadline) assert.fail(`serve did not start:\n${text}`);
+      await delay(50);
+    }
+
+    assert.equal((await fetch(`http://127.0.0.1:${port}/healthz`)).status, 200, "MCP is up");
+    assert.match(text, new RegExp(`端口 ${uiPort} 被占用，每 30 秒重试`));
+  } finally {
+    const exited = once(child, "exit");
+    child.kill("SIGTERM");
+    await exited;
+    busy.close();
+  }
 });

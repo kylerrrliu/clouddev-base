@@ -1,9 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
+import type { RequestId, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 import type { ActivityLog } from "./activity.ts";
-import { textResult, type ToolResult } from "./tools/common.ts";
+import { formatSize, textResult, type ToolResult } from "./tools/common.ts";
 import { editPath, listDirectory, readPath, writePath } from "./tools/files.ts";
 import { glob, grep } from "./tools/search.ts";
 import { DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, runCommand } from "./tools/shell.ts";
@@ -28,8 +28,10 @@ export interface McpServerOptions {
   progressIntervalMs?: number;
   /** Where tool calls are reported for the local activity page. */
   activity?: ActivityLog;
-  /** Display name of an OAuth client, for the activity page. */
-  clientName?: (clientId: string) => string | undefined;
+  /** Who is calling, as the activity page names it (the name the OAuth client registered with). */
+  client?: string;
+  /** Told the JSON-RPC id of every tool call that reaches a tool, so the caller can tell which ones were refused before. */
+  onToolCall?: (requestId: RequestId) => void;
 }
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
@@ -45,20 +47,22 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
    * Run a tool: turn exceptions into error results, report the call to the activity page,
    * and log one line per call to stderr. `logDetail` is what the log shows; the activity page,
    * which keeps everything in memory on this computer, always gets the full `summary`.
+   * `cancellable`: the tool stops when the client cancels (it passes extra.signal on).
    */
   const run = async (
-    call: { tool: string; summary: string; logDetail?: string; args: Record<string, unknown>; extra: ToolExtra },
+    call: { tool: string; summary: string; logDetail?: string; args: Record<string, unknown>; extra: ToolExtra; cancellable?: boolean },
     operation: (onOutput?: (text: string) => void) => Promise<ToolResult>,
   ): Promise<ToolResult> => {
     const startedAt = performance.now();
     const workspaceId = typeof call.args.workspace_id === "string" ? call.args.workspace_id : undefined;
-    const clientId = call.extra.authInfo?.clientId;
+    options.onToolCall?.(call.extra.requestId);
     const active = activity?.startCall({
       tool: call.tool,
       summary: call.summary,
       args: call.args,
       workspace: workspaceId === undefined ? undefined : registry.rootOf(workspaceId),
-      client: clientId === undefined ? undefined : options.clientName?.(clientId) ?? clientId,
+      client: options.client,
+      cancellable: call.cancellable,
     });
     let result: ToolResult;
 
@@ -153,7 +157,7 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
     (args, extra) => run({
       tool: "write",
       summary: args.path,
-      args: { ...args, content_bytes: Buffer.byteLength(args.content) },
+      args: { ...args, content_size: formatSize(Buffer.byteLength(args.content)) },
       extra,
     }, async () => {
       const { workspace_id, path, content } = args;
@@ -179,7 +183,8 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       },
       annotations: { ...WRITES_FILES, title: "Edit file" },
     },
-    (args, extra) => run({ tool: "edit", summary: args.path, args, extra }, async () => {
+    // The page lists at most 100 edits; the count tells how many there were.
+    (args, extra) => run({ tool: "edit", summary: args.path, args: { ...args, edits_count: args.edits.length }, extra }, async () => {
       const { workspace_id, path, edits } = args;
       const workspace = await registry.get(workspace_id);
       const absolute = await registry.resolvePath(workspace, path);
@@ -204,7 +209,7 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       },
       annotations: { ...READ_ONLY, title: "Search file contents" },
     },
-    (args, extra) => run({ tool: "grep", summary: args.pattern, args, extra }, async () => {
+    (args, extra) => run({ tool: "grep", summary: args.pattern, args, extra, cancellable: true }, async () => {
       const workspace = await registry.get(args.workspace_id);
       const target = await registry.resolvePath(workspace, args.path ?? ".");
 
@@ -232,7 +237,7 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       },
       annotations: { ...READ_ONLY, title: "Find files" },
     },
-    (args, extra) => run({ tool: "glob", summary: args.pattern, args, extra }, async () => {
+    (args, extra) => run({ tool: "glob", summary: args.pattern, args, extra, cancellable: true }, async () => {
       const workspace = await registry.get(args.workspace_id);
       const dir = await registry.resolvePath(workspace, args.path ?? ".");
 
@@ -259,8 +264,9 @@ export function createMcpServer(registry: WorkspaceRegistry, options: McpServerO
       tool: "bash",
       summary: args.command,
       logDetail: logCommands ? args.command : `(${args.command.length}-character command)`,
-      args,
+      args: { ...args, timeout: args.timeout ?? DEFAULT_TIMEOUT_SECONDS },
       extra,
+      cancellable: true,
     }, async (onOutput) => {
       const workspace = await registry.get(args.workspace_id);
       const cwd = args.working_directory ? await registry.resolvePath(workspace, args.working_directory) : workspace.root;

@@ -2,8 +2,10 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { Config } from "./config.ts";
+import { localBaseUrl, webUiUrl, type Config } from "./config.ts";
+import { escapeMarkup } from "./markup.ts";
 import { expandHome, isInside } from "./paths.ts";
+import { WEBUI_NAME } from "./webui.ts";
 
 /** launchd label of the background service (macOS). */
 export const SERVICE_LABEL = "com.clouddev-base.serve";
@@ -235,9 +237,9 @@ function builtCli(cliPath: string): string {
 }
 
 export function renderPlist(service: ServiceDefinition): string {
-  const string = (value: string) => `<string>${escapeXml(value)}</string>`;
+  const string = (value: string) => `<string>${escapeMarkup(value)}</string>`;
   const args = service.programArguments.map((arg) => `\t\t${string(arg)}`).join("\n");
-  const env = Object.entries(service.environment).map(([name, value]) => `\t\t<key>${escapeXml(name)}</key>\n\t\t${string(value)}`).join("\n");
+  const env = Object.entries(service.environment).map(([name, value]) => `\t\t<key>${escapeMarkup(name)}</key>\n\t\t${string(value)}`).join("\n");
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -274,10 +276,6 @@ ${env}
 </dict>
 </plist>
 `;
-}
-
-function escapeXml(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 }
 
 /**
@@ -357,7 +355,7 @@ export async function installService(config: Config, inputs: ServiceInputs, opti
   const squatter = await probe(config);
 
   if (squatter) {
-    console.error(`注意: ${localUrl(config)} 上已经有另一个 clouddev-base 在运行${squatter.pid ? `（pid ${squatter.pid}）` : ""}，可能是在终端里手动启动的 clouddev-base serve。
+    console.error(`注意: ${localBaseUrl(config.host, config.port)} 上已经有另一个 clouddev-base 在运行${squatter.pid ? `（pid ${squatter.pid}）` : ""}，可能是在终端里手动启动的 clouddev-base serve。
       先停掉它，后台服务才能用这个端口；在那之前后台服务每 10 秒重试一次。`);
   }
 
@@ -376,7 +374,7 @@ ${loaded.output}
 
     return pid !== undefined && (await probe(config))?.pid === pid;
   }, 15_000);
-  const ui = config.uiPort ? `http://127.0.0.1:${config.uiPort}` : "已关闭";
+  const ui = up ? await webUiState(config) : webUiUrl(config) ?? "已关闭";
   const status = up
     ? "后台服务已启动"
     : squatter
@@ -408,6 +406,10 @@ function printInstallNotes(config: Config, inputs: ServiceInputs, service: Servi
       launchd 启动的 node 没有终端那样的访问权限：B 的屏幕上会弹出授权窗口，没人点“允许”，服务就起不来（日志里是 EPERM，或者什么都没有）。
       最好把它移到 ~/work 这类目录（移动代码的话，在新位置重新运行 npm install 和 service install）；
       或者现在留意 B 屏幕上的弹窗并点“允许”，也可以在 系统设置 → 隐私与安全性 → 完全磁盘访问 里加入 ${service.programArguments[0]}。`);
+  }
+
+  if (service.environment.CLOUDDEV_BASE_LOG_COMMANDS === "1") {
+    console.error("注意: 当前终端设置了 CLOUDDEV_BASE_LOG_COMMANDS=1，它会带进后台服务：bash 命令的全文（可能带着密钥）会写进日志文件。不想这样的话，unset 这个变量后重新运行 service install。");
   }
 
   if (inputs.env.CLOUDDEV_BASE_PASSWORD?.trim()) {
@@ -457,7 +459,7 @@ export async function serviceStatus(config: Config, home: string): Promise<void>
 
   if (printed.status !== 0) {
     console.log(`后台服务没有安装或没有加载（${target()}）。安装: clouddev-base service install
-服务${answer ? `正在 ${localUrl(config)} 上运行（不是由 launchd 启动的${answer.pid ? `，pid ${answer.pid}` : ""}）` : "没有在运行"}。`);
+服务${answer ? `正在 ${localBaseUrl(config.host, config.port)} 上运行（不是由 launchd 启动的${answer.pid ? `，pid ${answer.pid}` : ""}）` : "没有在运行"}。`);
 
     return;
   }
@@ -475,8 +477,8 @@ export async function serviceStatus(config: Config, home: string): Promise<void>
   console.log(`后台服务: ${target()}
   状态:         ${field("state") ?? "未知"}${pid !== undefined ? `（pid ${pid}）` : ""}
   上次退出码:   ${field("last exit code") ?? "未知"}
-  健康检查:     ${health}（${localUrl(config)}/healthz）
-  WebUI:        ${config.uiPort ? `http://127.0.0.1:${config.uiPort}` : "已关闭"}
+  健康检查:     ${health}（${localBaseUrl(config.host, config.port)}/healthz）
+  WebUI:        ${await webUiState(config, pid)}
   日志:         ${logPath}`);
 }
 
@@ -523,25 +525,41 @@ async function unload(): Promise<boolean> {
   return true;
 }
 
-function localUrl(config: Config): string {
-  const host = ["0.0.0.0", "::"].includes(config.host) ? "127.0.0.1" : config.host.includes(":") ? `[${config.host}]` : config.host;
-
-  return `http://${host}:${config.port}`;
-}
-
 /** The clouddev-base answering on the configured port, with its pid; undefined when none answers. */
 async function probe(config: Config): Promise<{ pid?: number } | undefined> {
+  return identify(`${localBaseUrl(config.host, config.port)}/healthz`, "clouddev-base");
+}
+
+async function identify(url: string, name: string): Promise<{ pid?: number } | undefined> {
   try {
-    const response = await fetch(`${localUrl(config)}/healthz`, { signal: AbortSignal.timeout(2000) });
+    const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
 
     if (!response.ok) return undefined;
 
     const body = (await response.json()) as { name?: unknown; pid?: unknown };
 
-    return body.name === "clouddev-base" ? { pid: typeof body.pid === "number" ? body.pid : undefined } : undefined;
+    return body.name === name ? { pid: typeof body.pid === "number" ? body.pid : undefined } : undefined;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The WebUI address with how it is doing. The page is optional: when its port is taken the service runs without
+ * it and keeps retrying, which only the log would otherwise tell.
+ */
+async function webUiState(config: Config, servicePid = jobPid()): Promise<string> {
+  const url = webUiUrl(config);
+
+  if (!url) return "已关闭";
+
+  const answer = await identify(`${url}/api/health`, WEBUI_NAME);
+
+  if (answer && (servicePid === undefined || answer.pid === servicePid)) return `${url}（正常）`;
+
+  return answer
+    ? `${url}（端口上是另一个 clouddev-base 的 WebUI，pid ${answer.pid ?? "未知"}）`
+    : `${url}（没有响应：端口可能被别的程序占着，服务每 30 秒重试一次，见日志）`;
 }
 
 async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs: number): Promise<boolean> {

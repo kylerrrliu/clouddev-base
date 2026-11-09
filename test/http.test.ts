@@ -13,7 +13,7 @@ import { ActivityLog, type ActivityEvent } from "../src/activity.ts";
 import { ownerPasswordPath, writeJsonPrivate, type Config } from "../src/config.ts";
 import { configureHttpServer, createHttpApp, KEEP_ALIVE_TIMEOUT_MS } from "../src/http.ts";
 import { WorkspaceRegistry } from "../src/workspaces.ts";
-import { resultText, tempDir } from "./helpers.ts";
+import { httpGet, recordEvents, resultText, tempDir } from "./helpers.ts";
 
 const PASSWORD = "correct-horse-battery-staple";
 const REDIRECT_URI = "http://localhost:9999/callback";
@@ -164,14 +164,7 @@ function postMcp(token: string, body: unknown, signal?: AbortSignal): Promise<Re
 
 /** A plain GET with node:http, which (unlike fetch) can send any Host header. */
 function get(path: string, headers: Record<string, string> = {}): Promise<{ status: number; headers: IncomingHttpHeaders }> {
-  return new Promise((resolve, reject) => {
-    const req = request(`${base}${path}`, { headers }, (res) => {
-      res.resume();
-      resolve({ status: res.statusCode ?? 0, headers: res.headers });
-    });
-    req.on("error", reject);
-    req.end();
-  });
+  return httpGet(`${base}${path}`, headers);
 }
 
 /** Parse an error response, checking that it is brief JSON without stack traces or local paths. */
@@ -546,4 +539,25 @@ test("the activity log sees approvals, client connections and tool calls with th
   } finally {
     unsubscribe();
   }
+});
+
+test("tool calls the server refuses before any tool runs are listed as errors too", async () => {
+  const { client_id } = (await (await registerClient()).json()) as { client_id: string };
+  const { tokens } = await authorize(client_id);
+  const client = await connect(tokens!.access_token);
+  const workspace_id = await openWorkspace(client);
+  const events = recordEvents(activity);
+
+  // Arguments the schema rejects, a tool that does not exist, and one valid call that must be listed once.
+  await client.callTool({ name: "bash", arguments: { workspace_id, command: "make test", timeout: 600 } });
+  await client.callTool({ name: "no_such_tool", arguments: { path: "x" } });
+  await client.callTool({ name: "read", arguments: { workspace_id, path: "." } });
+  await client.close();
+
+  const finished = events.flatMap((event) => (event.type === "call.end" ? [event.call] : []));
+  assert.deepEqual(finished.map((call) => [call.tool, call.status]), [["bash", "error"], ["no_such_tool", "error"], ["read", "ok"]]);
+  assert.equal(finished[0]!.summary, "make test");
+  assert.match(finished[0]!.brief ?? "", /timeout|300/i);
+  assert.match(finished[1]!.brief ?? "", /no_such_tool/);
+  assert.ok(finished.every((call) => call.client === "Test Host"));
 });

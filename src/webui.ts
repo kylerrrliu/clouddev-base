@@ -1,16 +1,10 @@
-import { readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import type { ServerResponse } from "node:http";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
-import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
+import { localhostHostValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
 import type { ActivityLog } from "./activity.ts";
-
-/**
- * The activity page only ever listens here. The SSH tunnel forwards the MCP
- * port alone, so the page cannot be reached from the other computer, and it
- * needs no login.
- */
-export const WEBUI_HOST = "127.0.0.1";
 
 /** Shown in the page header. */
 export interface WebUiInfo {
@@ -26,11 +20,8 @@ export interface WebUiOptions {
   maxViewers?: number;
 }
 
-const ASSETS: Record<string, { file: string; type: string }> = {
-  "/": { file: "index.html", type: "text/html; charset=utf-8" },
-  "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
-  "/app.css": { file: "app.css", type: "text/css; charset=utf-8" },
-};
+/** Answer of GET /api/health: lets `service status` tell this page from another program on the port. */
+export const WEBUI_NAME = "clouddev-base-webui";
 
 /** A viewer that stops reading is dropped once this much is waiting for it; its page reconnects and resyncs. */
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
@@ -54,14 +45,14 @@ const CONTENT_SECURITY_POLICY = [
 export function createWebUiApp(activity: ActivityLog, info: WebUiInfo, options: WebUiOptions = {}) {
   const pingIntervalMs = options.pingIntervalMs ?? 15_000;
   const maxViewers = options.maxViewers ?? 16;
-  const assets = loadAssets();
+  const assets = assetsDir();
   let viewers = 0;
 
   const app = express();
   app.disable("x-powered-by");
   app.disable("etag");
 
-  app.use(hostHeaderValidation(["localhost", "127.0.0.1", "[::1]"]));
+  app.use(localhostHostValidation());
 
   app.use((_req: Request, res: Response, next: NextFunction) => {
     res.set({
@@ -86,14 +77,10 @@ export function createWebUiApp(activity: ActivityLog, info: WebUiInfo, options: 
     next();
   });
 
-  for (const [path, asset] of Object.entries(assets)) {
-    app.get(path, (_req, res) => {
-      res.type(asset.type).send(asset.body);
-    });
-  }
+  app.use(express.static(assets, { etag: false, lastModified: false, cacheControl: false, dotfiles: "ignore", redirect: false }));
 
-  app.get("/api/snapshot", (_req, res) => {
-    res.json({ type: "snapshot", server: info, ...activity.snapshot() });
+  app.get("/api/health", (_req, res) => {
+    res.json({ name: WEBUI_NAME, pid: process.pid });
   });
 
   app.get("/api/calls/:id", (req, res) => {
@@ -162,14 +149,12 @@ function writeEvent(res: ServerResponse, event: unknown): void {
 }
 
 /** The page files live next to this module: src/webui/ when run from source, dist/webui/ once built. */
-function loadAssets(): Record<string, { type: string; body: string }> {
-  const dir = new URL("./webui/", import.meta.url);
+function assetsDir(): string {
+  const dir = fileURLToPath(new URL("./webui/", import.meta.url));
 
-  return Object.fromEntries(Object.entries(ASSETS).map(([path, { file, type }]) => {
-    try {
-      return [path, { type, body: readFileSync(new URL(file, dir), "utf8") }];
-    } catch (error) {
-      throw new Error(`找不到 WebUI 文件 ${fileURLToPath(new URL(file, dir))}（从源码安装的话，重新运行 npm run build）: ${(error as Error).message}`);
-    }
-  }));
+  if (!existsSync(join(dir, "index.html"))) {
+    throw new Error(`找不到 WebUI 文件 ${join(dir, "index.html")}（从源码安装的话，重新运行 npm run build）`);
+  }
+
+  return dir;
 }

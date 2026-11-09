@@ -3,26 +3,14 @@
 #
 #   A 的 127.0.0.1:7676 ══ ssh -L ══► B 的 127.0.0.1:7676（clouddev-base）
 #
-# 隧道由 launchd 常驻：登录后自动启动；断线（心跳约 40 秒没有回应）或转发建不起来时 ssh 退出，
-# launchd 在 10 秒内重新连接；全程不需要人输入。可以重复运行（比如改端口），密钥和 B 的指纹会沿用。
-#
-# 写法上的约定：macOS 自带的 bash 3.2 在 UTF-8 环境下，会把紧跟在变量后面的中文标点算进变量名，
-# 再加上 set -u 就会报 unbound variable 退出。所以变量后面紧跟非 ASCII 字符时一律写成 ${NAME}
-# （test/tunnel.test.ts 会检查）。
+# 隧道由 launchd 常驻：登录后自动启动；断线或转发建不起来时 ssh 退出，由 launchd 重新连接；
+# 全程不需要人输入。可以重复运行（比如改端口），密钥和 B 的指纹会沿用。
+# 路径和几个检查在 common.sh 里，写法上的约定也见那里。
 set -euo pipefail
 
-LABEL="com.clouddev-base.tunnel"
-DIR="$HOME/.clouddev-tunnel"
-KEY="$DIR/id_ed25519"
-CONF="$DIR/ssh_config"
-LOCAL_CONF="$DIR/ssh_config.local"
-KNOWN="$DIR/known_hosts"
-RUN="$DIR/run.sh"
-LINE_FILE="$DIR/authorized_keys_line.txt"
-STAGED_PLIST="$DIR/$LABEL.plist"
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG="$HOME/Library/Logs/clouddev-tunnel.log"
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+# shellcheck source=common.sh
+. "$SCRIPT_DIR/common.sh"
 
 usage() {
   cat <<'EOF'
@@ -34,7 +22,10 @@ usage() {
       --no-load             只生成文件：不连接 B，也不装进 launchd（登录时不会自动启动）。之后去掉这个参数再运行一次即可
   -h, --help                显示帮助
 
-例子: client/tunnel/install.sh bob@192.168.1.20
+B 的地址最好用它在局域网里的名字（比如 bob-mac.local，在 B 上运行 scutil --get LocalHostName 再加上 .local），
+B 的 IP 变了也能连上；不在同一个局域网时用 B 的公网地址或域名。
+
+例子: client/tunnel/install.sh bob@bob-mac.local
       client/tunnel/install.sh -p 2222 bob@b.example.com
 
 会创建:
@@ -42,7 +33,7 @@ usage() {
   ~/.clouddev-tunnel/ssh_config        隧道专用的 ssh 配置（每次运行都重新生成）
   ~/.clouddev-tunnel/ssh_config.local  你自己补充的 ssh 设置（比如经中转机的 ProxyJump），本脚本不会改它
   ~/.clouddev-tunnel/known_hosts       B 的主机指纹
-  ~/.clouddev-tunnel/run.sh            launchd 运行的启动脚本
+  ~/.clouddev-tunnel/run.sh、common.sh launchd 运行的启动脚本
   ~/Library/LaunchAgents/com.clouddev-base.tunnel.plist（确认能连上 B 之后才装）
 日志: ~/Library/Logs/clouddev-tunnel.log    状态: client/tunnel/status.sh
 EOF
@@ -68,7 +59,7 @@ SSH_PORT=22
 LOCAL_PORT=7676
 REMOTE_PORT=7676
 LOAD=1
-TARGET=""
+SSH_TARGET=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -86,22 +77,22 @@ while [ $# -gt 0 ]; do
     -h | --help) usage; exit 0 ;;
     -*) die "未知选项: ${1}（--help 查看用法）" ;;
     *)
-      [ -z "$TARGET" ] || die "只能指定一个 B 的地址"
-      TARGET="$1"
+      [ -z "$SSH_TARGET" ] || die "只能指定一个 B 的地址"
+      SSH_TARGET="$1"
       shift
       ;;
   esac
 done
 
-[ -n "$TARGET" ] || { usage >&2; exit 1; }
+[ -n "$SSH_TARGET" ] || { usage >&2; exit 1; }
 
-case "$TARGET" in
+case "$SSH_TARGET" in
   *@*) ;;
-  *) die "请写成 <B 上的用户名>@<B 的地址>，例如 bob@192.168.1.20" ;;
+  *) die "请写成 <B 上的用户名>@<B 的地址>，例如 bob@bob-mac.local" ;;
 esac
 
-B_USER="${TARGET%%@*}"
-B_HOST="${TARGET#*@}"
+B_USER="${SSH_TARGET%%@*}"
+B_HOST="${SSH_TARGET#*@}"
 # user@[IPv6 地址] 的方括号去掉：ssh_config 里的 HostName 不要方括号。
 B_HOST="${B_HOST#\[}"
 B_HOST="${B_HOST%\]}"
@@ -116,13 +107,18 @@ if [ "$LOAD" = 1 ] && [ "$(uname -s)" != "Darwin" ]; then
   die "这个脚本用 launchd 管理隧道，只支持 macOS。Linux 上的做法见 README（systemd --user）；也可以加 --no-load 只生成配置文件。"
 fi
 
+ipv4_re='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+if [[ $B_HOST =~ $ipv4_re ]]; then
+  echo "提示: B 的 IP 变了（比如路由器重新分配了地址）隧道就会一直连不上。在同一个局域网里，可以改用 B 的名字：在 B 上运行 scutil --get LocalHostName，加上 .local（例如 bob-mac.local）。"
+fi
+
 umask 077
 mkdir -p "$DIR"
 chmod 700 "$DIR"
 
 # 新的 ssh 配置和启动脚本先写成 .new，确认能连上 B 之后才替换正在用的那份：
 # 中途失败、按了 Ctrl+C 或者参数写错时，已经在跑的隧道不受影响。
-trap 'rm -f "$CONF.new" "$RUN.new"' EXIT
+trap 'rm -f "$CONF.new" "$RUN.new" "$COMMON.new"' EXIT
 
 # 1. 隧道专用密钥。没有口令，后台运行时才不用等人输入；它在 B 上被限制为只能转发一个端口。
 if [ -f "$KEY" ]; then
@@ -139,14 +135,16 @@ touch "$KNOWN"
 if [ ! -f "$LOCAL_CONF" ]; then
   cat >"$LOCAL_CONF" <<'EOF'
 # clouddev-base 隧道的补充 ssh 设置。install.sh 不会改这个文件，重新运行也不会覆盖。
-# 它在 ssh_config 的最前面被引用，这里的设置优先生效。比如经中转机连 B（见 README“A 连不到 B 时”）:
+# 它在 ssh_config 的最前面被引用，这里的设置优先生效；ssh_config 末尾 "Host *" 那一段的
+# 加固设置（专用密钥、指纹检查、不等人输入、心跳）对这里加的主机同样生效。
+# 比如经中转机连 B（见 README“A 连不到 B 时”）:
 #
 #   Host clouddev-b
 #       ProxyJump clouddev-relay
 #
 #   Host clouddev-relay
 #       HostName r.example.com
-#       ...
+#       User tunnel
 EOF
 fi
 
@@ -162,6 +160,13 @@ Host clouddev-b
     User $B_USER
     # 主机指纹按别名记录：B 换了 IP 也不用重新确认
     HostKeyAlias clouddev-b
+    # A 的 127.0.0.1:$LOCAL_PORT → B 的 127.0.0.1:$REMOTE_PORT
+    LocalForward 127.0.0.1:$LOCAL_PORT 127.0.0.1:$REMOTE_PORT
+    # 转发建不起来（比如本机端口被占用）就退出，交给 launchd 重试
+    ExitOnForwardFailure yes
+
+# 下面这些对这个文件里用到的每台主机都生效（包括 ssh_config.local 里加的中转机），前面没设置过的才用这里的值。
+Host *
     IdentityFile "$KEY"
     IdentitiesOnly yes
     # 不经过 ssh-agent：1Password、Secretive 之类的 agent 不会弹出确认框
@@ -171,11 +176,7 @@ Host clouddev-b
     StrictHostKeyChecking yes
     BatchMode yes
     PreferredAuthentications publickey
-    # A 的 127.0.0.1:$LOCAL_PORT → B 的 127.0.0.1:$REMOTE_PORT
-    LocalForward 127.0.0.1:$LOCAL_PORT 127.0.0.1:$REMOTE_PORT
-    # 转发建不起来（比如本机端口被占用）就退出，交给 launchd 重试
-    ExitOnForwardFailure yes
-    # 保活和断线检测：10 秒没收到 B 的数据就在加密通道里发一次心跳，
+    # 保活和断线检测：10 秒没收到对方的数据就在加密通道里发一次心跳，
     # 连发 3 次都没有回应（约 40 秒）判定断线，ssh 退出，launchd 重新连接
     ServerAliveInterval 10
     ServerAliveCountMax 3
@@ -189,11 +190,13 @@ EOF
 #    放进那个目录的 plist，下次登录时 launchd 都会自动加载。
 cp "$SCRIPT_DIR/run.sh" "$RUN.new"
 chmod 700 "$RUN.new"
+cp "$SCRIPT_DIR/common.sh" "$COMMON.new"
+chmod 600 "$COMMON.new"
 
 cat >"$STAGED_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- 由 client/tunnel/install.sh 生成。登录后启动隧道；ssh 无论因为什么退出（断线、转发失败），都由 launchd 重新拉起，两次启动至少间隔 10 秒。 -->
+<!-- 由 client/tunnel/install.sh 生成。登录后启动隧道；ssh 无论因为什么退出（断线、转发失败），都由 launchd 重新拉起。 -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -251,6 +254,7 @@ EOF
 if [ "$LOAD" = 0 ]; then
   mv -f "$CONF.new" "$CONF"
   mv -f "$RUN.new" "$RUN"
+  mv -f "$COMMON.new" "$COMMON"
   echo
   echo "已生成文件（--no-load）：没有连接 B，也没有把隧道装进 launchd，登录时不会自动启动。B 上配好之后，去掉 --no-load 再运行一次。"
   if [ -f "$PLIST" ]; then
@@ -282,7 +286,7 @@ code=$?
 set -e
 
 case "$code" in
-  1) echo "✓ 能连上 B，而且这把钥匙在 B 上只能做端口转发。" ;;
+  1) ;;
   0) die "能连上 B，但这把钥匙在 B 上还能执行命令：authorized_keys 里那一行缺了前面的限制。换成上面完整的那一行，再运行一次本脚本。正在用的隧道配置没有改动。" ;;
   *)
     die "连不上 B，或者 B 不接受这把钥匙（ssh 退出码 ${code}）。正在用的隧道配置没有改动。请检查:
@@ -292,29 +296,47 @@ case "$code" in
     ;;
 esac
 
+# 再确认这把钥匙不能转发到 B 的别的端口：permitopen 生效时，B 会拒绝打开到 127.0.0.1:1 的通道（administratively
+# prohibited）；没有 permitopen 时，B 会真的去连那个端口，得到 Connection refused。
+probe="$(/usr/bin/ssh -F "$CONF.new" -o ClearAllForwardings=yes -W 127.0.0.1:1 clouddev-b </dev/null 2>&1 || true)"
+case "$probe" in
+  *"administratively prohibited"*) echo "✓ 能连上 B，而且这把钥匙在 B 上只能把连接转发到 127.0.0.1:${REMOTE_PORT}。" ;;
+  *"connect failed"* | *"Connection refused"*)
+    die "这把钥匙在 B 上还能转发到别的端口：authorized_keys 那一行缺了 permitopen=\"127.0.0.1:${REMOTE_PORT}\"。换成上面完整的那一行，再运行一次本脚本。正在用的隧道配置没有改动。" ;;
+  *) echo "注意: 没能确认 B 上的 permitopen 限制是否生效（ssh 输出: ${probe}）。请确认 authorized_keys 用的是上面完整的那一行。" ;;
+esac
+
 # 6. 换上新的配置和启动脚本，装好并加载 LaunchAgent。已经在运行的旧隧道先停掉，配置的改动才会生效。
 mv -f "$CONF.new" "$CONF"
 mv -f "$RUN.new" "$RUN"
+mv -f "$COMMON.new" "$COMMON"
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 cp "$STAGED_PLIST" "$PLIST"
 chmod 644 "$PLIST"
 echo "已写入 LaunchAgent: $PLIST"
 
-DOMAIN="gui/$(id -u)"
-launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+launchctl bootout "$TARGET" >/dev/null 2>&1 || true
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break
+  launchctl print "$TARGET" >/dev/null 2>&1 || break
   sleep 0.5
 done
-launchctl enable "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
-launchctl bootstrap "$DOMAIN" "$PLIST" ||
+
+# 旧隧道停掉之后还占着本机端口的，就是别的程序了：隧道要等它让出端口才能连上。
+squatters="$(port_listeners "$LOCAL_PORT")"
+if [ -n "${squatters// /}" ]; then
+  echo "注意: 本机 ${LOCAL_PORT} 端口已经被别的程序占用（pid ${squatters% }），隧道要等它释放端口才能工作:" >&2
+  lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >&2 || true
+fi
+
+launchctl enable "$TARGET" >/dev/null 2>&1 || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST" ||
   die "launchd 没能加载 ${PLIST}。如果在 系统设置 → 通用 → 登录项与扩展 里关掉过它的后台运行，先打开再重试。"
 
-# 7. 经隧道访问 B 上的 clouddev-base。
+# 7. 经隧道访问 B 上的 clouddev-base：端口上必须是隧道的 ssh，而且 B 有回答。
 echo "隧道已交给 launchd，等待连通…"
 ok=0
 for _ in $(seq 1 20); do
-  if curl -fsS -m 3 "http://127.0.0.1:$LOCAL_PORT/healthz" 2>/dev/null | grep -q clouddev-base; then
+  if tunnel_up "$LOCAL_PORT"; then
     ok=1
     break
   fi
@@ -327,7 +349,7 @@ if [ "$ok" = 1 ]; then
   cat <<EOF
 
 ✓ 隧道已连通：这台电脑的 http://127.0.0.1:${LOCAL_PORT} 现在就是 B 上的 clouddev-base。
-  登录后会自动启动；断线约 40 秒内被发现，随后自动重连。
+  登录后会自动启动；断线后自动重连。
 
 下一步:
   1. client/.mcp.json 里的 url 设为 $MCP_URL
@@ -339,11 +361,11 @@ else
   cat <<EOF
 
 隧道已安装，但 20 秒内经隧道访问不到 B 上的 clouddev-base（http://127.0.0.1:${LOCAL_PORT}/healthz）。可能的原因:
+  - 本机 ${LOCAL_PORT} 端口被别的程序占用（上面会有提示，日志里也会有 Address already in use）
   - B 上的服务没在运行：在 B 上运行 clouddev-base service status
   - B 上的服务端口不是 ${REMOTE_PORT}：用 --remote-port 指定后重新运行本脚本
   - authorized_keys 那一行不完整（要有 port-forwarding 和 permitopen="127.0.0.1:${REMOTE_PORT}"），
     或者这把钥匙前面还有一条更早的旧行（sshd 只认第一行，要删掉旧的）
-  - 本机 ${LOCAL_PORT} 端口被别的程序占用（日志里会有 Address already in use）
 隧道会在后台继续重试。最近的日志（${LOG}）:
 EOF
   tail -n 15 "$LOG" 2>/dev/null || true

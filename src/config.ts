@@ -8,6 +8,8 @@ export const DEFAULT_PORT = 7676;
 export const DEFAULT_HOST = "127.0.0.1";
 /** The activity page. It always listens on 127.0.0.1 only; 0 turns it off. */
 export const DEFAULT_UI_PORT = 7677;
+/** The only address the activity page listens on: the SSH tunnel forwards the MCP port alone. */
+export const WEBUI_HOST = "127.0.0.1";
 
 /** What lives in ~/.clouddev-base/config.json. Every field is optional. */
 export interface StoredConfig {
@@ -72,12 +74,17 @@ export function loadConfig(overrides: ConfigOverrides = {}, env: NodeJS.ProcessE
     throw new Error("没有配置允许访问的目录。请先运行 `clouddev-base init --root <目录>`，或在启动时传入 --root。");
   }
 
-  const localHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host.includes(":") ? `[${host}]` : host;
-  const publicUrl = normalizePublicUrl(overrides.publicUrl ?? stored.publicUrl ?? `http://${localHost}:${port}`);
-  const uiPort = overrides.uiPort ?? stored.uiPort ?? DEFAULT_UI_PORT;
+  const publicUrl = normalizePublicUrl(overrides.publicUrl ?? stored.publicUrl ?? localBaseUrl(host, port));
+  const chosenUiPort = overrides.uiPort ?? stored.uiPort;
+  let uiPort = chosenUiPort ?? DEFAULT_UI_PORT;
 
   if (uiPort !== 0 && uiPort === port) {
-    throw new Error(`WebUI 端口不能和 MCP 端口相同（都是 ${port}）。用 --ui-port 换一个，或设为 0 关闭 WebUI。`);
+    if (chosenUiPort !== undefined) {
+      throw new Error(`WebUI 端口不能和 MCP 端口相同（都是 ${port}）。用 --ui-port 换一个，或设为 0 关闭 WebUI。`);
+    }
+
+    // Only the default collides (MCP itself was put on 7677): move the page next door instead of refusing to start.
+    uiPort = port === 65_535 ? port - 1 : port + 1;
   }
 
   return {
@@ -91,6 +98,18 @@ export function loadConfig(overrides: ConfigOverrides = {}, env: NodeJS.ProcessE
     // Checked by `service install`, the only user, so a typo here never stops `serve`.
     serviceEnv: Array.isArray(stored.serviceEnv) ? stored.serviceEnv.filter((name): name is string => typeof name === "string") : [],
   };
+}
+
+/** How this computer reaches a server listening on `host`: a wildcard address means loopback. */
+export function localBaseUrl(host: string, port: number): string {
+  const name = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host.includes(":") ? `[${host}]` : host;
+
+  return `http://${name}:${port}`;
+}
+
+/** Where the activity page is, or undefined when it is turned off. */
+export function webUiUrl(config: Pick<Config, "uiPort">): string | undefined {
+  return config.uiPort ? `http://${WEBUI_HOST}:${config.uiPort}` : undefined;
 }
 
 /** Keep only the origin. A pasted ".../mcp" URL is accepted too. */
