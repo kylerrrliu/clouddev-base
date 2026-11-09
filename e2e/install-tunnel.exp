@@ -1,0 +1,57 @@
+#!/usr/bin/expect -f
+# 只有一台 Mac 时的端到端测试用（见 e2e/README.md 的“只有一台 Mac 时”）：替你应答 client/tunnel/install.sh 的两处交互。
+#   1. “B 上配好之后按回车继续”：直接回车，所以 authorized_keys 那一行要事先加好；
+#   2. ssh 第一次连接时确认 B 的主机指纹：把 ssh 显示的指纹和本机 /etc/ssh/ssh_host_<类型>_key.pub 算出的指纹比对，
+#      一致才回答 yes；不一致或读不到就回答 no，install.sh 随即失败退出，不会装上任何东西。
+# 只适用于 A 和 B 是同一台电脑：两台电脑时请直接在终端里运行 install.sh，自己核对 B 的指纹。
+# 依赖 install.sh 提示里的 “Ctrl+C” 字样；改了那句提示，这里也要跟着改。
+#
+# 用法: expect e2e/install-tunnel.exp <install.sh 的路径> [install.sh 的参数…]
+# 例子: expect e2e/install-tunnel.exp ~/clouddev-e2e/client/tunnel/install.sh --local-port 17676 "$(id -un)@127.0.0.1"
+
+if {[llength $argv] < 1} {
+  puts stderr "用法: expect e2e/install-tunnel.exp <install.sh 的路径> \[install.sh 的参数…\]"
+  exit 64
+}
+
+set timeout 90
+set shown ""
+set ktype ""
+
+spawn {*}$argv
+
+expect {
+  -ex "Ctrl+C" { send "\r" }
+  timeout { puts "\n\[expect\] 没等到“按回车继续”的提示"; exit 2 }
+  eof { catch wait r; exit [lindex $r 3] }
+}
+
+expect {
+  -re {([A-Z0-9]+) key fingerprint is:? (SHA256:[A-Za-z0-9+/=]+)} {
+    set ktype [string tolower $expect_out(1,string)]
+    set shown $expect_out(2,string)
+    exp_continue
+  }
+  -ex {(yes/no/[fingerprint])?} {
+    set pub "/etc/ssh/ssh_host_${ktype}_key.pub"
+    if {$ktype eq "" || [catch {exec ssh-keygen -lf $pub} line]} {
+      puts "\n\[expect\] 没认出 ssh 显示的指纹，或读不到 $pub，回答 no"
+      send "no\r"
+    } else {
+      set local [lindex [split $line " "] 1]
+      if {$local eq $shown} {
+        puts "\n\[expect\] ssh 显示的指纹和本机 $pub 一致（$shown），回答 yes"
+        send "yes\r"
+      } else {
+        puts "\n\[expect\] 指纹不一致（ssh: $shown，本机: $local），回答 no"
+        send "no\r"
+      }
+    }
+    exp_continue
+  }
+  timeout { puts "\n\[expect\] install.sh 超时"; exit 2 }
+  eof
+}
+
+catch wait r
+exit [lindex $r 3]

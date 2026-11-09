@@ -393,6 +393,8 @@ npm run typecheck
 npm run build      # 编译到 dist/，并把 src/webui/ 复制过去
 ```
 
+用两台电脑把真实的服务、隧道和 Claude Code 从头到尾走一遍（只有一台 Mac 也可以），见 [e2e/README.md](e2e/README.md)。
+
 ```text
 src/
   cli.ts            命令行：init / serve / service / password
@@ -423,4 +425,6 @@ client/             在电脑 A 上启动 Claude Code 用的目录（见“用�
   .mcp.json
   CLAUDE.md
   tunnel/           A 上的 SSH 隧道：install.sh / run.sh / status.sh / uninstall.sh，共用的路径和检查在 common.sh
+e2e/                端到端测试：流程说明（两台电脑，也可以只用一台 Mac）、演示项目 demo-app、在 A 上运行的冒烟测试 smoke.mjs、
+                    只有一台 Mac 时代答 install.sh 交互的 install-tunnel.exp
 ```
