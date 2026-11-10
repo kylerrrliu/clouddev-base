@@ -87,7 +87,7 @@ cp -R e2e/demo-app ~/clouddev-e2e/work/
 ~/clouddev-e2e/bin/clouddev-base service status
 ```
 
-- `init` 会打印 Owner 密码，A 上认证时要用。以后在 B 上用 `~/clouddev-e2e/bin/clouddev-base password` 查看。
+- `init` 会在终端里显示新生成的 Owner 密码，A 上认证时要用。以后在 B 的终端里用 `~/clouddev-e2e/bin/clouddev-base password --show` 查看。
 - `init` 还会打印一条给 A 用的 `install.sh` 命令，里面的 `<用户名>@<名字>.local` 就是下面要用的“B 的地址”。
 - `service status` 的健康检查和 WebUI 都应该是“正常”。
 
@@ -124,7 +124,7 @@ B 的地址用第 1 步 `init` 打印的那个（比如 `bob@bob-mac.local`）�
 
 然后按 README“在 B 上”第 5 步，写好 `/etc/ssh/sshd_config.d/010-clouddev.conf`（要 sudo）：
 
-- `AllowStreamLocalForwarding local` 是必须的。
+- `AllowStreamLocalForwarding local` 是必须的：没有它，第 5 步的 `install.sh` 会停下，并给出一个要在 B 上删掉的 `/tmp/clouddev-probe-….sock`。
 - `PasswordAuthentication no` 会关掉密码登录。加之前确认你登录 B 不靠密码；上面用密码 ssh 加钥匙的话，那一步已经做完了，不受影响。
 
 ## 5. A：装隧道
@@ -137,7 +137,7 @@ B 的地址用第 1 步 `init` 打印的那个（比如 `bob@bob-mac.local`）�
 
 按回车后，ssh 会问是否信任 B 的主机指纹。在 B 上运行 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`，指纹一致再输入 `yes`，也可以直接粘贴 B 上看到的 `SHA256:…` 指纹。
 
-成功时 `install.sh` 会打印两个 ✓：钥匙在 B 上只能转发到 127.0.0.1:7676，以及“隧道已连通”。`~/clouddev-e2e/client/tunnel/status.sh` 应该显示 `state = running`，经隧道访问“正常”。
+成功时 `install.sh` 会依次打印六个 ✓：钥匙在 B 上执行不了命令；B 不让它随便转发（试了 127.0.0.1:1）；它不能在 B 上监听端口；不能在 B 上建 Unix socket；能转发到 B 的 127.0.0.1:7676，那里回答的是 clouddev-base；最后是“隧道已连通”。`~/clouddev-e2e/client/tunnel/status.sh` 应该显示 `state = running`，经隧道访问“正常”。
 
 ## 6. A：冒烟测试
 
@@ -147,10 +147,10 @@ B 的地址用第 1 步 `init` 打印的那个（比如 `bob@bob-mac.local`）�
 node e2e/smoke.mjs
 ```
 
-它先确认隧道是通的，再提示输入 B 的 Owner 密码：在 B 上运行 `~/clouddev-e2e/bin/clouddev-base password` 查看，粘贴进去（不显示）。检查这些：
+它先确认隧道是通的，再提示输入 B 的 Owner 密码：在 B 的终端里运行 `~/clouddev-e2e/bin/clouddev-base password --show` 查看，粘贴进去（不显示）。检查这些：
 
 - A 的 7676 端口是隧道的 ssh 在监听，不是 A 上别的程序；
-- 经隧道能访问 B 上的 `/healthz`。它会打印 B 上服务的 pid：在 B 上运行 `curl http://127.0.0.1:7676/healthz`，pid 应该相同；
+- 经隧道能访问 B 上的 `/healthz`。它会打印 B 上服务的 pid：在 B 上运行 `curl --noproxy '*' http://127.0.0.1:7676/healthz`，pid 应该相同；
 - 不带令牌访问 `/mcp` 返回 401；
 - OAuth：授权服务器元数据、动态注册、授权页；输错 Owner 密码被拒绝，输对拿到授权码；换到访问令牌和刷新令牌；
 - MCP：`initialize`，`tools/list` 正好是 7 个工具；
@@ -175,13 +175,13 @@ node e2e/smoke.mjs
 在 A 上：
 
 ```bash
-cd ~/clouddev-e2e/client && claude
+~/clouddev-e2e/client/start.sh
 ```
 
 1. 第一次启动时选信任这个目录。
-2. 输入 `/mcp`，选 clouddev-base 认证。浏览器打开授权页后，输入 B 的 Owner 密码。
+2. 输入 `/mcp`，选 clouddev-base 认证。浏览器打开授权页后，输入 B 的 Owner 密码。`/mcp` 里应该只有 clouddev-base 这一个服务；`/context` 里它的工具算在“MCP tools”里，不在“MCP tools (deferred)”里（启动时就全部加载了）。
 3. 让 Claude 修演示项目：“打开 ~/clouddev-e2e/work/demo-app，跑一下测试并修复失败的用例”。应该看到：
-   - Claude 只用 clouddev-base 的工具，A 上的文件和命令工具被 `client/.claude/settings.json` 禁用了；
+   - Claude 只用 clouddev-base 的工具：`start.sh` 只给它留了几样不碰 A 的自带工具，A 上的文件和命令工具也被 `client/.claude/settings.json` 禁用了；
    - 打开工作区、读取、搜索自动允许，改文件和执行命令每次都先问你；
    - 它找到两个 bug：`average()` 的循环从下标 1 开始，漏掉了第一个数；`median()` 的 `sort()` 没传比较函数，按字符串排序；
    - 修完后 `npm test` 全部通过。B 的 WebUI 实时显示每一步，展开 `edit` 能看到改了什么。
@@ -246,7 +246,7 @@ sudo rm /etc/ssh/sshd_config.d/010-clouddev.conf
   ~/clouddev-e2e/client/tunnel/install.sh --no-load --local-port 17676 "$(id -un)@127.0.0.1"
   ```
 
-- 第 5 步：`install.sh` 同样要加 `--local-port 17676`，地址同样写 `"$(id -un)@127.0.0.1"`（也可以用下面的 expect）。
+- 第 5 步：`install.sh` 会沿用第 3 步的 `--local-port 17676`（打印“沿用上次的端口设置”），写上也一样；地址同样写 `"$(id -un)@127.0.0.1"`（也可以用下面的 expect）。
 
 **第 4 步。** 加钥匙直接追加：
 
@@ -254,7 +254,7 @@ sudo rm /etc/ssh/sshd_config.d/010-clouddev.conf
 (umask 077; cat ~/.clouddev-tunnel/authorized_keys_line.txt >> ~/.ssh/authorized_keys)
 ```
 
-sshd 设置可以不加：钥匙不出这台电脑。但远程登录开着期间，局域网里也能连到这台电脑的 22 端口；加上它，密码登录就关掉了。远程登录从没打开过的 Mac 上，`/etc/ssh` 里还没有主机密钥，第一次有连接进来时 macOS 才生成。
+sshd 设置也要照第 4 步加上：`install.sh` 会试这把钥匙能不能在 B 上建 Unix socket，没有 `AllowStreamLocalForwarding local` 就会停下。另外远程登录开着期间，局域网里也能连到这台电脑的 22 端口，加上 `PasswordAuthentication no`，密码登录就关掉了。远程登录从没打开过的 Mac 上，`/etc/ssh` 里还没有主机密钥，第一次有连接进来时 macOS 才生成。
 
 **第 5 步。** 可以让 expect 代答 `install.sh` 的两处交互。它把 ssh 显示的指纹和本机 `/etc/ssh` 里的主机公钥比对，一致才回答 `yes`，否则回答 `no`，`install.sh` 随即失败退出：
 
@@ -262,13 +262,13 @@ sshd 设置可以不加：钥匙不出这台电脑。但远程登录开着期间
 expect e2e/install-tunnel.exp ~/clouddev-e2e/client/tunnel/install.sh --local-port 17676 "$(id -un)@127.0.0.1"
 ```
 
-**第 6 步。** 加上端口，密码直接用管道传：
+**第 6 步。** 加上端口，密码直接用管道传（`password --show` 会提示输出不是终端，这里密码只经管道交给 smoke.mjs，可以忽略）：
 
 ```bash
-~/clouddev-e2e/bin/clouddev-base password | node e2e/smoke.mjs --tunnel-port 17676
+~/clouddev-e2e/bin/clouddev-base password --show | node e2e/smoke.mjs --tunnel-port 17676
 ```
 
-**第 9 步。** 去掉钥匙那一行时，`blob` 直接取：`blob="$(awk '{ print $2 }' ~/.clouddev-tunnel/id_ed25519.pub)"`。没加过 sshd 设置的话，跳过 `sudo rm` 那一行。
+**第 9 步。** 去掉钥匙那一行时，`blob` 直接取：`blob="$(awk '{ print $2 }' ~/.clouddev-tunnel/id_ed25519.pub)"`。
 
 ## 注意
 

@@ -1,10 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { localBaseUrl, webUiUrl, type Config } from "./config.ts";
+import { homeDir, localBaseUrl, webUiUrl, type Config, type ListenAddresses } from "./config.ts";
 import { escapeMarkup } from "./markup.ts";
-import { expandHome, isInside } from "./paths.ts";
+import { isInside } from "./paths.ts";
 import { WEBUI_NAME } from "./webui.ts";
 
 /** launchd label of the background service (macOS). */
@@ -209,7 +209,8 @@ export function defineService({ home, nodePath, cliPath, env }: ServiceInputs, e
   };
 
   // Where the configuration lives and the logging choice carry over. The Owner password never goes into the plist.
-  if (env.CLOUDDEV_BASE_HOME) environment.CLOUDDEV_BASE_HOME = resolve(expandHome(env.CLOUDDEV_BASE_HOME));
+  // A blank CLOUDDEV_BASE_HOME counts as unset, as it does for serve.
+  if (env.CLOUDDEV_BASE_HOME?.trim()) environment.CLOUDDEV_BASE_HOME = homeDir(env);
   if (env.CLOUDDEV_BASE_LOG_COMMANDS) environment.CLOUDDEV_BASE_LOG_COMMANDS = env.CLOUDDEV_BASE_LOG_COMMANDS;
 
   for (const name of [...DEFAULT_SERVICE_ENV, ...extraEnv]) {
@@ -392,7 +393,7 @@ ${loaded.output}
 查看状态: clouddev-base service status
 重启:     launchctl kickstart -k ${target()}
 卸载:     clouddev-base service uninstall
-改了配置（clouddev-base init …）、换了 node 的安装方式，或者想更新 PATH 等环境变量时，重新运行 clouddev-base service install（经 Claude 在 B 上运行也可以）。`);
+改了配置（clouddev-base init …）、更新了 clouddev-base 的代码、换了 node 的安装方式，或者想更新 PATH 等环境变量时，重新运行 clouddev-base service install（经 Claude 在 B 上运行也可以）。`);
 }
 
 function printInstallNotes(config: Config, inputs: ServiceInputs, service: ServiceDefinition, guardedFiles: Array<{ what: string; path: string }>): void {
@@ -414,7 +415,7 @@ function printInstallNotes(config: Config, inputs: ServiceInputs, service: Servi
 
   if (inputs.env.CLOUDDEV_BASE_PASSWORD?.trim()) {
     console.error(`注意: 当前终端设置了 CLOUDDEV_BASE_PASSWORD，但 Owner 密码不会写进 plist。后台服务授权时用的是 ${join(config.homeDir, "auth.json")} 里的密码；
-      在没设这个变量的终端里运行 clouddev-base password 可以看到它。`);
+      在没设这个变量的终端里运行 clouddev-base password --show 可以看到它。`);
   }
 
   const invalid = config.serviceEnv.filter((name) => !ENV_NAME.test(name) || NEVER_CARRIED.has(name));
@@ -450,12 +451,13 @@ export async function uninstallService(inputs: ServiceInputs): Promise<void> {
   console.log(wasLoaded || hadFile ? `已停止并移除后台服务（${plistPath}）。` : "没有安装后台服务。");
 }
 
-export async function serviceStatus(config: Config, home: string): Promise<void> {
+/** `config`: where the service listens; `service status` also works out where when serve would refuse the config. */
+export async function serviceStatus(config: ListenAddresses, inputs: ServiceInputs): Promise<void> {
   requireLaunchd();
 
   const printed = launchctl("print", target());
   const answer = await probe(config);
-  const { logPath } = servicePaths(home);
+  const { logPath } = servicePaths(inputs.home);
 
   if (printed.status !== 0) {
     console.log(`后台服务没有安装或没有加载（${target()}）。安装: clouddev-base service install
@@ -480,9 +482,67 @@ export async function serviceStatus(config: Config, home: string): Promise<void>
   健康检查:     ${health}（${localBaseUrl(config.host, config.port)}/healthz）
   WebUI:        ${await webUiState(config, pid)}
   日志:         ${logPath}`);
+
+  const code = jobCode(printed.output, inputs.cliPath);
+  const changed = pid === undefined ? undefined : changedSinceStart(code, pid);
+
+  if (changed) {
+    console.log(`注意: 服务启动之后，clouddev-base 的代码更新过（${code} 改于 ${changed.toLocaleString()}），服务还在运行旧代码。
+      运行 clouddev-base service install 换上新代码（经 Claude 在 B 上运行也可以）。`);
+  }
 }
 
-function requireLaunchd(): void {
+/** The folder holding the code the job runs (dist/, or src/ without a build): its file is the second argument. */
+function jobCode(printed: string, cliPath: string): string {
+  const args = /^\s*arguments = \{\n([\s\S]*?)\n\s*\}/m.exec(printed)?.[1]?.split("\n").map((arg) => arg.trim());
+  const cli = args?.[1];
+
+  return dirname(cli && isAbsolute(cli) ? cli : builtCli(cliPath));
+}
+
+/**
+ * When the code in `folder` last changed, if that was after the process started: npm install rebuilds dist/, but
+ * launchd starts the new code only once the old process exits. Undefined when it was not, or cannot be told.
+ */
+function changedSinceStart(folder: string, pid: number): Date | undefined {
+  const started = processStart(pid);
+  const changed = lastChange(folder);
+
+  return started !== undefined && changed !== undefined && changed > started ? new Date(changed) : undefined;
+}
+
+/** When a process started, from its elapsed time ([[dd-]hh:]mm:ss): the date ps prints depends on the locale. */
+function processStart(pid: number): number | undefined {
+  const result = spawnSync("ps", ["-o", "etime=", "-p", String(pid)], { encoding: "utf8" });
+  const match = /^\s*(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)\s*$/.exec(result.stdout ?? "");
+
+  if (result.status !== 0 || !match) return undefined;
+
+  const [days, hours, minutes, seconds] = match.slice(1).map((part) => Number(part ?? 0)) as [number, number, number, number];
+
+  return Date.now() - (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+}
+
+/** The newest modification time of the files in `folder` and below it. */
+function lastChange(folder: string): number | undefined {
+  let newest: number | undefined;
+
+  try {
+    for (const entry of readdirSync(folder, { recursive: true, withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+
+      const time = statSync(join(entry.parentPath, entry.name)).mtimeMs;
+
+      if (newest === undefined || time > newest) newest = time;
+    }
+  } catch {
+    return undefined;
+  }
+
+  return newest;
+}
+
+export function requireLaunchd(): void {
   if (process.platform !== "darwin") {
     throw new Error("service 命令只支持 macOS（launchd）。Linux 可以用 systemd --user 单元，见 README。");
   }
@@ -526,7 +586,7 @@ async function unload(): Promise<boolean> {
 }
 
 /** The clouddev-base answering on the configured port, with its pid; undefined when none answers. */
-async function probe(config: Config): Promise<{ pid?: number } | undefined> {
+async function probe(config: ListenAddresses): Promise<{ pid?: number } | undefined> {
   return identify(`${localBaseUrl(config.host, config.port)}/healthz`, "clouddev-base");
 }
 
@@ -548,7 +608,7 @@ async function identify(url: string, name: string): Promise<{ pid?: number } | u
  * The WebUI address with how it is doing. The page is optional: when its port is taken the service runs without
  * it and keeps retrying, which only the log would otherwise tell.
  */
-async function webUiState(config: Config, servicePid = jobPid()): Promise<string> {
+async function webUiState(config: ListenAddresses, servicePid = jobPid()): Promise<string> {
   const url = webUiUrl(config);
 
   if (!url) return "已关闭";
@@ -559,7 +619,7 @@ async function webUiState(config: Config, servicePid = jobPid()): Promise<string
 
   return answer
     ? `${url}（端口上是另一个 clouddev-base 的 WebUI，pid ${answer.pid ?? "未知"}）`
-    : `${url}（没有响应：端口可能被别的程序占着，服务每 30 秒重试一次，见日志）`;
+    : `${url}（没有响应：端口可能被别的程序占着，服务每 30 秒重试一次；也可能缺少 WebUI 的文件。原因见日志）`;
 }
 
 async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs: number): Promise<boolean> {

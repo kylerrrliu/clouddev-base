@@ -8,8 +8,11 @@ export const MAX_NOTICES = 200;
 const MAX_ARG_CHARS = 8 * 1024;
 /** Items kept from an array argument (the edits of an `edit`). */
 const MAX_ARG_ITEMS = 100;
-/** Result text kept per finished call. */
-export const MAX_RESULT_CHARS = 16 * 1024;
+/**
+ * Result text the activity page keeps per finished call. Not the limit on tool results themselves: that is
+ * MAX_RESULT_CHARS in tools/common.ts.
+ */
+export const MAX_RECORDED_RESULT_CHARS = 16 * 1024;
 /** Live output shown per running call (only bash streams output): the end of it. */
 export const MAX_LIVE_OUTPUT_CHARS = 64 * 1024;
 /** Live output is pushed to viewers at most this often. */
@@ -285,7 +288,7 @@ export class ActivityLog {
 
   private end(record: CallRecord, text: string, keepTail: boolean): void {
     record.endedAt = Date.now();
-    record.text = own(keepTail ? clipTail(text, MAX_RESULT_CHARS) : clipHead(text, MAX_RESULT_CHARS));
+    record.text = own(keepTail ? clipTail(text, MAX_RECORDED_RESULT_CHARS) : clipHead(text, MAX_RECORDED_RESULT_CHARS));
     record.cut = record.text.length < text.length;
     const brief = briefOf(text, keepTail);
     record.brief = brief === undefined ? undefined : own(brief);
@@ -343,11 +346,28 @@ function summaryFromArgs(args: Record<string, unknown>): string {
   return "";
 }
 
+/**
+ * The line a finished call is summed up by: the last one for bash, else the first one of the content. grep, glob
+ * and read put their notes first ("[Stopped after 100 results. …]"), then a blank line, then the content, which
+ * tells more about the call, and is what a search of the activity page looks for.
+ */
 function briefOf(text: string, last: boolean): string | undefined {
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const line = last ? lines.at(-1) : lines[0];
+  const lines = text.split(/\r?\n/).map((line) => line.trim());
+  const line = last ? lines.findLast(Boolean) : (lines.slice(contentStart(lines)).find(Boolean) ?? lines.find(Boolean));
 
   return line === undefined ? undefined : clipHead(line, MAX_BRIEF_CHARS);
+}
+
+/**
+ * Where a result's content starts: after a leading block of "[…]" note lines and the blank line that ends it, else
+ * at the top. Without that blank line a bracketed first line is content, such as a TOML "[package]" header.
+ */
+function contentStart(lines: string[]): number {
+  let notes = 0;
+
+  while (notes < lines.length && /^\[.*\]$/.test(lines[notes]!)) notes++;
+
+  return notes > 0 && lines[notes] === "" ? notes + 1 : 0;
 }
 
 /** Arguments with long strings and arrays cut, so one big `write` cannot bloat the page. */

@@ -3,7 +3,8 @@
     "clouddev-base": {
       "type": "http",
       "url": "http://127.0.0.1:7676/mcp",
-      "timeout": 330000
+      "timeout": 330000,
+      "alwaysLoad": true
     }
   }
 }

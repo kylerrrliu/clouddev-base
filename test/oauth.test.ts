@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { readFile, rm } from "node:fs/promises";
+import { chmod, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { Response } from "express";
 import { OwnerOAuthProvider } from "../src/oauth.ts";
-import { tempDir } from "./helpers.ts";
+import { captureStderr, tempDir } from "./helpers.ts";
 
 const PASSWORD = "correct-horse-battery-staple";
 const REDIRECT_URI = "http://localhost:9999/callback";
@@ -66,6 +66,73 @@ test("deleting oauth.json signs every client out at once, and the old data is ne
   assert.deepEqual(Object.keys(saved.clients), [next.client_id]);
   assert.deepEqual(saved.tokens, {});
   await assert.rejects(provider(stateDir).verifyAccessToken(tokens.access_token));
+});
+
+test("a healthy oauth.json survives a restart: clients stay signed in and nothing is moved aside", async () => {
+  const stateDir = await tempDir();
+  const first = provider(stateDir);
+  const client = await register(first);
+  const tokens = await signIn(first, client);
+
+  // What the server itself wrote must pass its own checks, or every restart would sign every client out.
+  let restarted: OwnerOAuthProvider | undefined;
+  assert.deepEqual(await captureStderr(() => (restarted = provider(stateDir))), []);
+  assert.deepEqual(await readdir(stateDir), ["oauth.json"]);
+  assert.ok(await restarted!.clientsStore.getClient(client.client_id));
+  assert.equal((await restarted!.verifyAccessToken(tokens.access_token)).clientId, client.client_id);
+  assert.ok((await restarted!.exchangeRefreshToken(client, tokens.refresh_token!)).access_token);
+});
+
+test("an oauth.json that may not be read (mode 000) gets 0600 back: clients stay signed in", { skip: process.getuid?.() === 0 ? "root reads any file" : false }, async () => {
+  const stateDir = await tempDir();
+  const first = provider(stateDir);
+  const client = await register(first);
+  const tokens = await signIn(first, client);
+  await chmod(join(stateDir, "oauth.json"), 0o000);
+
+  let restarted: OwnerOAuthProvider | undefined;
+  const logged = await captureStderr(() => (restarted = provider(stateDir)));
+
+  assert.match(logged.join("\n"), /oauth\.json[^\n]*权限改回 600/);
+  assert.deepEqual(await readdir(stateDir), ["oauth.json"], "nothing moved aside");
+  assert.equal((await stat(join(stateDir, "oauth.json"))).mode & 0o777, 0o600);
+  assert.equal((await restarted!.verifyAccessToken(tokens.access_token)).clientId, client.client_id);
+});
+
+test("a broken oauth.json is moved aside: the server starts empty and clients sign in again", async () => {
+  const broken = [
+    "",
+    '{"clients":{"a":{"client_id":"a"',
+    "null",
+    "[]",
+    '{"clients": [], "tokens": {}}',
+    '{"clients": {"a": {"client_id": "a"}}, "tokens": {}}',
+    '{"clients": {}, "tokens": {"hash": {"kind": "access"}}}',
+  ];
+
+  for (const content of broken) {
+    const stateDir = await tempDir();
+    await writeFile(join(stateDir, "oauth.json"), content);
+
+    let oauth: OwnerOAuthProvider | undefined;
+    const logged = await captureStderr(() => (oauth = provider(stateDir)));
+
+    assert.match(logged.join("\n"), /oauth\.json[\s\S]*重新授权/, content);
+    const names = await readdir(stateDir);
+    assert.equal(names.length, 1, content);
+    assert.match(names[0]!, /^oauth\.json\.corrupt-/, content);
+    assert.equal(await readFile(join(stateDir, names[0]!), "utf8"), content, "the broken file is kept as it was");
+
+    const client = await register(oauth!);
+    const tokens = await signIn(oauth!, client);
+    assert.equal((await oauth!.verifyAccessToken(tokens.access_token)).clientId, client.client_id);
+  }
+
+  // Lists that are merely missing are not damage.
+  const stateDir = await tempDir();
+  await writeFile(join(stateDir, "oauth.json"), "{}");
+  assert.deepEqual(await captureStderr(() => provider(stateDir)), []);
+  assert.deepEqual(await readdir(stateDir), ["oauth.json"]);
 });
 
 test("a flood of registrations never evicts a client that is signed in", async () => {

@@ -13,11 +13,11 @@ test("read pages through files, lists folders and recognises binaries and images
   await writeTree(root, { "big.txt": lines, "small.txt": "a\r\nb\r\nc\r\n", "dir/x.txt": "x", "bin.dat": Buffer.from([1, 0, 2]), "dot.png": png, "empty.txt": "" });
 
   const first = resultText(await readPath(join(root, "big.txt"), "big.txt"));
-  assert.match(first, /^line 1\n/);
-  assert.match(first, /\[Showing lines 1-2000 of 2500\. Use offset=2001 to continue\.\]$/);
+  assert.match(first, /^\[Showing lines 1-2000 of 2500\. Use offset=2001 to continue\.\]\n\nline 1\n/);
+  assert.match(first, /\nline 2000$/);
 
   const page = resultText(await readPath(join(root, "big.txt"), "big.txt", 2001, 3));
-  assert.equal(page, "line 2001\nline 2002\nline 2003\n\n[497 more lines in the file. Use offset=2004 to continue.]");
+  assert.equal(page, "[Lines 2001-2003 of 2500; 497 more lines after them. Use offset=2004 to continue.]\n\nline 2001\nline 2002\nline 2003");
 
   assert.equal(resultText(await readPath(join(root, "small.txt"), "small.txt")), "a\nb\nc");
   assert.equal(resultText(await readPath(join(root, "dir"), "dir")), "Directory dir (1 entries):\nx.txt");
@@ -116,7 +116,7 @@ test("bash kills commands on timeout and on cancellation", async () => {
   const timedOut = await runCommand("echo started; sleep 10", root, 1);
 
   assert.equal(timedOut.isError, true);
-  assert.equal(resultText(timedOut), "started\n\nCommand timed out after 1 seconds and was killed.");
+  assert.equal(resultText(timedOut), "started\n\nCommand timed out after 1 second: sent SIGTERM and it stopped.");
   assert.ok(Date.now() - startedAt < 4000);
 
   startedAt = Date.now();
@@ -133,7 +133,7 @@ test("bash returns promptly when a command leaves a background process", async (
   const startedAt = Date.now();
 
   const result = await runCommand("sleep 3 & echo launched", root);
-  assert.equal(resultText(result), "launched");
+  assert.match(resultText(result), /^\[A background process still holds this command's output\.[^\n]*\]\nlaunched$/);
   assert.ok(Date.now() - startedAt < 2000, "should not wait for the background process");
 
   const redirected = await runCommand("nohup sleep 3 > /dev/null 2>&1 & echo ok", root);

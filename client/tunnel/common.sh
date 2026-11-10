@@ -21,6 +21,25 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/clouddev-tunnel.log"
 TARGET="gui/$(id -u)/$LABEL"
 
+# install.sh 上次生成的 ssh_config 里 Host clouddev-b 那一段的三个端口和 B 的地址，写在一行里，没有的写 -：
+# B 的 SSH 端口（Port），A 上监听的端口和 B 上 clouddev-base 的端口（LocalForward 127.0.0.1:A 127.0.0.1:B），
+# B 的地址（HostName，照文件里的写法：IPv6 地址里的 % 是 %%）。
+# 地址放在最后：只要端口的 status.sh 用 read -r _ PORT _ 读，多出来的这一项落进最后那个变量。
+# 只读这个文件自己的行：它 Include 的 ssh_config.local 不算。
+conf_ports() {
+  if [ -f "$CONF" ]; then
+    awk '
+      tolower($1) == "host" { b = ($2 == "clouddev-b") }
+      b && tolower($1) == "hostname" && host == "" { host = $2 }
+      b && tolower($1) == "port" && port == "" { port = $2 }
+      b && tolower($1) == "localforward" && lport == "" { n = split($2, l, ":"); m = split($3, r, ":"); lport = l[n]; rport = r[m] }
+      END { print (port == "" ? "-" : port), (lport == "" ? "-" : lport), (rport == "" ? "-" : rport), (host == "" ? "-" : host) }
+    ' "$CONF" 2>/dev/null || echo "- - - -"
+  else
+    echo "- - - -"
+  fi
+}
+
 # 这台电脑上在这个 TCP 端口监听的进程（pid，空格分隔）。
 port_listeners() {
   { lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null || true; } | tr '\n' ' '
@@ -42,7 +61,9 @@ tunnel_up() {
     *) return 1 ;;
   esac
 
-  tunnel_up_body="$(curl -fsS -m 3 "http://127.0.0.1:$1/healthz" 2>/dev/null)" || return 1
+  # --noproxy：终端里设了 http_proxy 或 all_proxy 时，curl 连 127.0.0.1 也会走代理；代理不放行本机地址的话，
+  # 好好的隧道也会被当成不通。
+  tunnel_up_body="$(curl --noproxy '*' -fsS -m 3 "http://127.0.0.1:$1/healthz" 2>/dev/null)" || return 1
 
   case "$tunnel_up_body" in
     *clouddev-base*) return 0 ;;

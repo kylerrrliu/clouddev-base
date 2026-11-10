@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { realpath } from "node:fs/promises";
+import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { ActivityLog, MAX_CALLS, MAX_LIVE_OUTPUT_CHARS, MAX_NOTICES, MAX_RESULT_CHARS } from "../src/activity.ts";
-import { textResult } from "../src/tools/common.ts";
-import { captureStderr, recordEvents } from "./helpers.ts";
+import { ActivityLog, MAX_CALLS, MAX_LIVE_OUTPUT_CHARS, MAX_NOTICES, MAX_RECORDED_RESULT_CHARS } from "../src/activity.ts";
+import { textResult, type ToolResult } from "../src/tools/common.ts";
+import { readPath } from "../src/tools/files.ts";
+import { grep } from "../src/tools/search.ts";
+import { captureStderr, recordEvents, resultText, tempDir, writeTree } from "./helpers.ts";
 
 test("a call is reported when it starts and when it ends, with its outcome", () => {
   const log = new ActivityLog();
@@ -46,15 +50,49 @@ test("errors and cancellations are told apart; bash keeps the end of its output"
   assert.equal(second?.status, "cancelled");
 
   const long = log.startCall({ tool: "bash", summary: "yes", args: {} });
-  long.finish(textResult(`${"x".repeat(MAX_RESULT_CHARS)}THE END`), false);
+  long.finish(textResult(`${"x".repeat(MAX_RECORDED_RESULT_CHARS)}THE END`), false);
   const kept = log.call(long.id)!;
   assert.ok(kept.output.endsWith("THE END"));
-  assert.equal(kept.output.length, MAX_RESULT_CHARS);
+  assert.equal(kept.output.length, MAX_RECORDED_RESULT_CHARS);
   assert.equal(kept.outputTruncated, true);
 
   const read = log.startCall({ tool: "read", summary: "big.txt", args: {} });
-  read.finish(textResult(`START${"y".repeat(MAX_RESULT_CHARS)}`), false);
+  read.finish(textResult(`START${"y".repeat(MAX_RECORDED_RESULT_CHARS)}`), false);
   assert.ok(log.call(read.id)!.output.startsWith("START"), "other tools keep the beginning");
+});
+
+test("a result that starts with notes is summed up by its first line of content", async () => {
+  const log = new ActivityLog();
+  const briefOf = (tool: string, result: ToolResult) => {
+    const call = log.startCall({ tool, summary: tool, args: {} });
+    call.finish(result, false);
+
+    return log.call(call.id)?.brief;
+  };
+
+  // grep and read as they really answer: notes, a blank line, then the matches or the file's lines.
+  const root = await realpath(await tempDir());
+  await writeTree(root, {
+    "logo.bin": Buffer.from([0, 1, 2]),
+    "src/app.ts": "export const needle = 1;\n",
+    "long.txt": Array.from({ length: 2500 }, (_, i) => `line ${i + 1}`).join("\n"),
+  });
+
+  const searched = await grep(root, root, { pattern: "needle", maxResults: 10 });
+  assert.match(resultText(searched), /^\[Not searched: 1 binary file\.\]\n\n/);
+  assert.equal(briefOf("grep", searched), "src/app.ts:1:export const needle = 1;");
+
+  const paged = await readPath(join(root, "long.txt"), "long.txt");
+  assert.match(resultText(paged), /^\[Showing lines 1-2000 of 2500\./);
+  assert.equal(briefOf("read", paged), "line 1");
+
+  assert.equal(briefOf("glob", textResult("[Showing 2 of 9 files. Use a more specific pattern or path.]\n[Only the first 5 files were considered.]\n\n\n  src/a.ts\nsrc/b.ts")), "src/a.ts");
+  // Without a blank line after it, a bracketed first line is content: a TOML table read from a file, say.
+  assert.equal(briefOf("read", textResult("[package]\nname = \"demo\"\n\n[dependencies]")), "[package]");
+  // Nothing after the notes: they are all there is to show.
+  assert.equal(briefOf("glob", textResult("[Only the first 5 files were considered.]\n\n")), "[Only the first 5 files were considered.]");
+  // bash is still summed up by its last line.
+  assert.equal(briefOf("bash", textResult("[Output truncated: showing the last 2 of 9 lines.]\n\nok 9\nall passed\n")), "all passed");
 });
 
 test("a tool that finishes despite a cancel keeps its outcome and is marked as not delivered", () => {

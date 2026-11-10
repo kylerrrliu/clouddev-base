@@ -9,8 +9,12 @@ set -u
 LINES="${1:-20}"
 
 # 本机监听的端口取自 ssh_config 里的 LocalForward 127.0.0.1:<端口> ...
-PORT="$(awk '$1 == "LocalForward" { n = split($2, part, ":"); print part[n]; exit }' "$CONF" 2>/dev/null)"
-PORT="${PORT:-7676}"
+read -r _ PORT _ <<EOF
+$(conf_ports)
+EOF
+case "$PORT" in
+  '' | *[!0-9]*) PORT=7676 ;;
+esac
 
 echo "launchd（${TARGET}）:"
 if info="$(launchctl print "$TARGET" 2>/dev/null)"; then

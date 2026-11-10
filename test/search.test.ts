@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import * as fs from "node:fs";
+import { chmod, mkdir, readFile, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 import ts from "typescript";
+import { MAX_BYTES, MAX_RESULT_CHARS } from "../src/tools/common.ts";
 import { listFiles } from "../src/tools/file-list.ts";
 import { readIndexPaths } from "../src/tools/git-index.ts";
 import { configValue, isIgnored, parseIgnoreFile } from "../src/tools/gitignore.ts";
 import { compileWildmatch } from "../src/tools/glob-match.ts";
 import { activeSearchWorkers, compileGlob, glob, grep } from "../src/tools/search.ts";
-import { runGlob, runGrep } from "../src/tools/search-worker.ts";
+import { MAX_SEARCHED_FILE_BYTES, runGlob, runGrep } from "../src/tools/search-worker.ts";
 import { resultText, tempDir, writeTree } from "./helpers.ts";
 
 // Keep the developer's own global Git ignore file out of these tests. Search
@@ -53,6 +55,18 @@ function gitIndex(entries: Array<{ path: string; mode: number }>): Buffer {
 function hasGit(): boolean {
   try {
     execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether bash can run what grep advises for a big UTF-16 file. (`iconv --version` fails on macOS; `-l` works.) */
+function hasIconv(): boolean {
+  if (process.platform === "win32") return false;
+
+  try {
+    execFileSync("iconv", ["-l"], { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -199,8 +213,9 @@ test("grep and glob search a plain folder and skip dependency folders", async ()
     "logo.bin": Buffer.from([0, 1, 2, 109, 97, 105, 110]),
   });
 
+  // logo.bin holds "main" too, but binary files are not searched, only counted.
   const all = resultText(await grep(root, root, { pattern: "main", maxResults: 100 }));
-  assert.equal(all, "README.md:1:Run main() to start\nsrc/app.ts:2:export function main() {}");
+  assert.equal(all, "[Not searched: 1 binary file.]\n\nREADME.md:1:Run main() to start\nsrc/app.ts:2:export function main() {}");
 
   const ts = resultText(await grep(root, root, { pattern: "todo", ignoreCase: true, glob: "*.ts", maxResults: 100 }));
   assert.equal(ts, "src/app.ts:3:// TODO: tidy");
@@ -211,7 +226,8 @@ test("grep and glob search a plain folder and skip dependency folders", async ()
   const limited = resultText(await grep(root, root, { pattern: ".", maxResults: 2 }));
   assert.match(limited, /\[Stopped after 2 results/);
 
-  assert.equal(resultText(await grep(root, root, { pattern: "nothing-here", maxResults: 10 })), "No matches found.");
+  assert.equal(resultText(await grep(root, root, { pattern: "nothing-here", maxResults: 10 })), "No matches found. Not searched: 1 binary file.");
+  assert.equal(resultText(await grep(join(root, "src"), root, { pattern: "nothing-here", maxResults: 10 })), "No matches found.");
   await assert.rejects(grep(root, root, { pattern: "(", maxResults: 10 }), /Invalid regular expression/);
   await assert.rejects(grep(join(root, "nope"), root, { pattern: "x", maxResults: 10 }), /^Error: Path not found: nope$/);
   await assert.rejects(glob(join(root, "nope"), root, "*", 10), /^Error: Path not found: nope$/);
@@ -220,7 +236,7 @@ test("grep and glob search a plain folder and skip dependency folders", async ()
   assert.equal(resultText(await glob(root, root, "*.{ts,js}", 200)), "src/app.ts\nsrc/util.js");
   assert.equal(resultText(await glob(join(root, "src"), root, "*.ts", 200)), "src/app.ts");
   assert.equal(resultText(await glob(root, root, "*.py", 200)), "No files found.");
-  assert.equal(resultText(await glob(root, root, "*", 2)), "README.md\nlogo.bin\n\n[Showing 2 of 4 files. Use a more specific pattern or path.]");
+  assert.equal(resultText(await glob(root, root, "*", 2)), "[Showing 2 of 4 files. Use a more specific pattern or path.]\n\nREADME.md\nlogo.bin");
 
   // A single file can be searched directly.
   assert.equal(resultText(await grep(join(root, "src/app.ts"), root, { pattern: "TODO", maxResults: 10 })), "src/app.ts:3:// TODO: tidy");
@@ -665,4 +681,380 @@ test("a search path swapped for a symlink is refused, and results never leave th
   // Even if the swap happened before the main thread looked, the workspace root bounds every result.
   assert.deepEqual(runGrep({ ...grepRequest, expectedRealTarget: outside }).lines, []);
   assert.deepEqual(runGlob({ ...globRequest, expectedRealDir: outside }).paths, []);
+});
+
+// Root reads files whatever their permissions, and Windows has no chmod: tests of unreadable files need neither.
+const permissionsBind = process.platform !== "win32" && process.getuid?.() !== 0;
+
+/** A file of about 2.2MB, over grep's 2MB limit, whose last line is `last`. */
+function overTwoMegabytes(last: string): string {
+  return `${"filler line\n".repeat(190_000)}${last}\n`;
+}
+
+const MB = 1024 * 1024;
+
+/**
+ * A file of `size` bytes that starts with `start`; the rest reads as NUL bytes and takes no disk space on most file
+ * systems. Over grep's limit only the start is looked at, to tell binary files from text.
+ */
+async function sparseFile(path: string, start: string | Buffer, size: number): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, start);
+  await truncate(path, size);
+}
+
+/** Text longer than the part of a big file that is looked at, so its sparse rest does not count. */
+const TEXT_START = "GET /api/items 200 12ms\n".repeat(400);
+
+test("a file named on its own that is not searched gets an error saying why", async () => {
+  const root = await realpath(await tempDir());
+  await writeTree(root, {
+    "server.log": overTwoMegabytes("ERROR: disk full"),
+    "edge.log": `${"x".repeat(2 * MB)}\n`,
+    // As Windows tools write logs: UTF-16 with a byte-order mark.
+    "win16.log": Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(overTwoMegabytes("ERROR: disk full"), "utf16le")]),
+    "logo.bin": Buffer.from([0, 1, 2, ...Buffer.from("ERROR")]),
+    // UTF-32's byte-order mark starts like UTF-16LE's; it is not taken for one.
+    "wide.txt": Buffer.concat([Buffer.from([0xff, 0xfe, 0, 0]), Buffer.from("E\0\0\0R\0\0\0")]),
+    "secret.txt": "ERROR\n",
+  });
+  await sparseFile(join(root, "big dump.log"), TEXT_START, 12 * MB);
+  await sparseFile(join(root, "dump 16.log"), Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(TEXT_START, "utf16le").swap16()]), 12 * MB);
+  const search = (path: string) => grep(join(root, path), root, { pattern: "ERROR", maxResults: 10 });
+
+  // bash comes first: it can search the file. read can page through it, but only up to its own 10MB limit.
+  const big = await search("server.log");
+  assert.equal(big.isError, true);
+  assert.equal(
+    resultText(big),
+    "server.log is 2.2MB, over grep's 2MB limit, so it was not searched. " +
+      "Search it in bash: grep -n 'PATTERN' server.log | head -50, or rg. read with offset/limit can show parts of it.",
+  );
+  assert.equal(
+    resultText(await search("big dump.log")),
+    "big dump.log is 12.0MB, over grep's 2MB limit, so it was not searched. " +
+      "Search it in bash: grep -n 'PATTERN' 'big dump.log' | head -50, or rg. It is over read's 10MB limit as well: tail or sed -n in bash can show parts of it.",
+  );
+  // A size that rounds to the limit comes with its byte count.
+  assert.match(resultText(await search("edge.log")), /^edge\.log is 2\.0MB \(2,097,153 bytes\), over grep's 2MB limit,/);
+
+  // grep in bash matches bytes and finds nothing in UTF-16 text: for such a file the advice decodes it first. read
+  // shows UTF-16 decoded, so it is still offered up to its limit; past it, tail and sed -n get iconv's output too.
+  const win16 = resultText(await search("win16.log"));
+  assert.equal(
+    win16,
+    "win16.log is 4.3MB, over grep's 2MB limit, so it was not searched. " +
+      "It is UTF-16: search it in bash with iconv -f UTF-16LE -t UTF-8 win16.log | grep -n 'PATTERN' | head -50. read with offset/limit can show parts of it.",
+  );
+  assert.equal(
+    resultText(await search("dump 16.log")),
+    "dump 16.log is 12.0MB, over grep's 2MB limit, so it was not searched. " +
+      "It is UTF-16: search it in bash with iconv -f UTF-16BE -t UTF-8 'dump 16.log' | grep -n 'PATTERN' | head -50. " +
+      "It is over read's 10MB limit as well: iconv piped to tail or sed -n in bash can show parts of it.",
+  );
+
+  // The command advised finds the line, with the file's own line number.
+  if (hasIconv()) {
+    const advised = /search it in bash with (.+ \| head -50)\./.exec(win16)![1]!.replace("PATTERN", "ERROR: disk");
+    assert.equal(execFileSync("/bin/sh", ["-c", advised], { cwd: root, encoding: "utf8" }), "190001:ERROR: disk full\n");
+  }
+
+  const binary = await search("logo.bin");
+  assert.equal(binary.isError, true);
+  assert.match(resultText(binary), /^logo\.bin looks like a binary file \(it has a NUL byte near the start\), so it was not searched\./);
+  assert.match(resultText(await search("wide.txt")), /^wide\.txt looks like a binary file/);
+
+  if (process.platform !== "win32") {
+    execFileSync("mkfifo", [join(root, "pipe")]);
+    const pipe = await search("pipe");
+    assert.equal(pipe.isError, true);
+    assert.equal(resultText(pipe), "pipe is not a regular file, so it was not searched.");
+  }
+
+  if (permissionsBind) {
+    try {
+      await chmod(join(root, "secret.txt"), 0o000);
+      const unreadable = await search("secret.txt");
+      assert.equal(unreadable.isError, true);
+      assert.equal(resultText(unreadable), "secret.txt could not be read (permission denied), so it was not searched.");
+    } finally {
+      await chmod(join(root, "secret.txt"), 0o644);
+    }
+  }
+});
+
+test("a folder search names what it could not search, also when nothing matched", { skip: !permissionsBind && "file permissions do not bind here" }, async () => {
+  const root = await realpath(await tempDir());
+  await writeTree(root, {
+    "a.txt": "needle here\n",
+    "logs/1.log": overTwoMegabytes("needle"),
+    "logs/2.log": overTwoMegabytes("needle"),
+    "logs/3.log": overTwoMegabytes("needle"),
+    "logs/4.log": overTwoMegabytes("needle"),
+    "logo.png": Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0x0d, ...Buffer.from("needle")]),
+    "locked/inside.txt": "needle\n",
+    "noexec/inside.txt": "needle\n",
+    "secret.txt": "needle\n",
+  });
+
+  try {
+    await chmod(join(root, "locked"), 0o000);
+    await chmod(join(root, "noexec"), 0o444); // its names can be listed, but its files cannot be opened
+    await chmod(join(root, "secret.txt"), 0o000);
+
+    const skipped ="Not searched: 4 files over 2MB (logs/1.log, logs/2.log, logs/3.log and 1 more), 1 binary file, " +
+      "2 unreadable files (noexec/inside.txt, secret.txt), 1 unreadable folder (locked/).";
+
+    assert.equal(resultText(await grep(root, root, { pattern: "needle", maxResults: 10 })), `[${skipped}]\n\na.txt:1:needle here`);
+    assert.equal(resultText(await grep(root, root, { pattern: "absent", maxResults: 10 })), `No matches found. ${skipped}`);
+
+    // Only files the glob selects count; an unreadable folder may hold some.
+    assert.equal(
+      resultText(await grep(root, root, { pattern: "absent", glob: "*.log", maxResults: 10 })),
+      "No matches found. Not searched: 4 files over 2MB (logs/1.log, logs/2.log, logs/3.log and 1 more), 1 unreadable folder (locked/).",
+    );
+
+    // An unreadable folder named on its own.
+    assert.equal(
+      resultText(await grep(join(root, "locked"), root, { pattern: "needle", maxResults: 10 })),
+      "No matches found. Not searched: 1 unreadable folder (locked/).",
+    );
+
+    // glob cannot see into an unreadable folder either.
+    assert.equal(resultText(await glob(root, root, "a.*", 100)), "[Not searched: 1 unreadable folder (locked/).]\n\na.txt");
+    assert.equal(resultText(await glob(root, root, "*.md", 100)), "No files found. Not searched: 1 unreadable folder (locked/).");
+
+    // The listing goes on past the unreadable folder.
+    const listing = listFiles(root);
+    assert.deepEqual(listing.unreadable, ["locked"]);
+    assert.ok(listing.files.includes("secret.txt") && listing.files.includes("logs/4.log"));
+  } finally {
+    await chmod(join(root, "locked"), 0o755);
+    await chmod(join(root, "noexec"), 0o755);
+    await chmod(join(root, "secret.txt"), 0o644);
+  }
+
+  // Readable again: nothing is reported.
+  assert.equal(
+    resultText(await grep(root, root, { pattern: "needle", glob: "*.txt", maxResults: 10 })),
+    "a.txt:1:needle here\nlocked/inside.txt:1:needle\nnoexec/inside.txt:1:needle\nsecret.txt:1:needle",
+  );
+});
+
+test("skipped files and folders outside the workspace are not reported", { skip: !permissionsBind && "file permissions do not bind here" }, async () => {
+  const workspace = await realpath(await tempDir());
+  const outside = await realpath(await tempDir());
+  await writeTree(workspace, { "sub/inside.txt": "marker\n" });
+  await writeTree(outside, { "big.log": overTwoMegabytes("marker"), "locked/x.txt": "marker\n", "secret.txt": "marker\n" });
+  const sub = join(workspace, "sub");
+
+  // As above: `sub` becomes a link to a folder outside before the worker starts.
+  await rm(sub, { recursive: true });
+  await symlink(outside, sub);
+
+  try {
+    await chmod(join(outside, "locked"), 0o000);
+    await chmod(join(outside, "secret.txt"), 0o000);
+
+    const grepped = runGrep({
+      op: "grep", target: sub, expectedRealTarget: outside, isFile: false, displayRoot: workspace,
+      pattern: "marker", ignoreCase: false, filesOnly: false, maxResults: 10, fileLimit: 1000,
+    });
+    const globbed = runGlob({ op: "glob", dir: sub, expectedRealDir: outside, displayRoot: workspace, pattern: "*", maxResults: 10, fileLimit: 1000 });
+
+    assert.deepEqual(grepped.lines, []);
+    assert.equal(grepped.skipped.tooLarge.count, 0);
+    assert.equal(grepped.skipped.unreadableFiles.count, 0);
+    assert.equal(grepped.skipped.unreadableFolders.count, 0);
+    assert.equal(globbed.unreadableFolders.count, 0);
+  } finally {
+    await chmod(join(outside, "locked"), 0o755);
+    await chmod(join(outside, "secret.txt"), 0o644);
+  }
+});
+
+test("big binary files are counted with the binary files, so the big files named are those that may hold text", async () => {
+  const root = await realpath(await tempDir());
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52]);
+
+  // Media sorts before the logs. Named among the big files, it would push the log into "and 3 more".
+  for (const name of ["assets/a.png", "assets/b.mp4", "assets/c.woff2", "assets/d.zip"]) await sparseFile(join(root, name), png, 3 * MB);
+  await sparseFile(join(root, "logs/dev.log"), TEXT_START, 3 * MB);
+  // A UTF-16 log has NUL bytes as well, but it is text.
+  await sparseFile(join(root, "logs/win.log"), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(TEXT_START, "utf16le")]), 3 * MB);
+  await writeTree(root, { "small.png": png });
+
+  assert.equal(
+    resultText(await grep(root, root, { pattern: "needle", maxResults: 10 })),
+    "No matches found. Not searched: 2 files over 2MB (logs/dev.log, logs/win.log), 5 binary files.",
+  );
+
+  // Named on its own, a big binary file gets the answer for binary files.
+  const named = await grep(join(root, "assets/b.mp4"), root, { pattern: "needle", maxResults: 10 });
+  assert.equal(named.isError, true);
+  assert.equal(
+    resultText(named),
+    "assets/b.mp4 looks like a binary file (it has a NUL byte near the start), so it was not searched. To search it anyway, use grep -a in bash.",
+  );
+
+  // Of a big file, its size reaches the main thread, not the bytes read to classify it; of a UTF-16 one, also its
+  // encoding, which the advice on searching it depends on.
+  const notSearched = (path: string) => runGrep({
+    op: "grep", target: join(root, path), expectedRealTarget: join(root, path), isFile: true, displayRoot: root,
+    pattern: "needle", ignoreCase: false, filesOnly: false, maxResults: 10, fileLimit: 1000,
+  }).notSearched;
+  assert.deepEqual(notSearched("logs/dev.log"), { reason: "too-large", size: 3 * MB });
+  assert.deepEqual(notSearched("logs/win.log"), { reason: "too-large", size: 3 * MB, utf16: "utf-16le" });
+});
+
+test("a folder that can be listed but not entered is reported, with the files and folders listed in it", { skip: !permissionsBind && "file permissions do not bind here" }, async () => {
+  const root = await realpath(await tempDir());
+  await writeTree(root, {
+    "a.txt": "needle\n",
+    "docs/readme.md": "needle\n",
+    "docs/private/notes.txt": "needle\n",
+    "docs/private/drafts/x.txt": "needle\n",
+    "shared/notes.txt": "needle\n",
+    "shared/sub/deep.txt": "needle\n",
+  });
+
+  try {
+    // As chmod -R 644 leaves them: their names can be listed (r), but nothing in them opened or entered (no x).
+    await chmod(join(root, "shared"), 0o644);
+    await chmod(join(root, "docs/private"), 0o644); // inside a normal folder
+
+    const skipped = "Not searched: 2 unreadable files (docs/private/notes.txt, shared/notes.txt), " +
+      "2 unreadable folders (docs/private/drafts/, shared/sub/).";
+
+    assert.equal(resultText(await grep(root, root, { pattern: "needle", maxResults: 10 })), `[${skipped}]\n\na.txt:1:needle\ndocs/readme.md:1:needle`);
+    assert.equal(resultText(await grep(root, root, { pattern: "absent", maxResults: 10 })), `No matches found. ${skipped}`);
+    assert.equal(
+      resultText(await grep(join(root, "shared"), root, { pattern: "needle", maxResults: 10 })),
+      "No matches found. Not searched: 1 unreadable file (shared/notes.txt), 1 unreadable folder (shared/sub/).",
+    );
+
+    // glob names the files it found but could not check, and does not count them among the results.
+    assert.equal(resultText(await glob(root, root, "*.txt", 100)), `[${skipped}]\n\na.txt`);
+    assert.equal(resultText(await glob(root, root, "notes.*", 100)), `No files found. ${skipped}`);
+    assert.equal(
+      resultText(await glob(root, root, "*.md", 100)),
+      "[Not searched: 2 unreadable folders (docs/private/drafts/, shared/sub/).]\n\ndocs/readme.md",
+    );
+  } finally {
+    await chmod(join(root, "shared"), 0o755);
+    await chmod(join(root, "docs/private"), 0o755);
+  }
+});
+
+test("a folder full of skipped files is resolved once, not once per file", async (t) => {
+  const root = await realpath(await tempDir());
+  const count = 12;
+
+  for (let i = 0; i < count; i++) {
+    await sparseFile(join(root, `logs/${String(i).padStart(2, "0")}.log`), TEXT_START, MAX_SEARCHED_FILE_BYTES + 1);
+  }
+  await writeTree(root, { "a.txt": "needle\n" });
+
+  const realpaths = t.mock.method(fs.realpathSync, "native");
+  const reply = runGrep({
+    op: "grep", target: root, expectedRealTarget: root, isFile: false, displayRoot: root,
+    pattern: "needle", ignoreCase: false, filesOnly: false, maxResults: 10, fileLimit: 1000,
+  });
+  const calls = realpaths.mock.callCount();
+  realpaths.mock.restore();
+
+  assert.deepEqual(reply.lines, ["a.txt:1:needle"]);
+  assert.equal(reply.skipped.tooLarge.count, count);
+  assert.ok(calls < count, `${calls} realpath calls for ${count} skipped files in one folder`);
+});
+
+test("files with a byte-order mark are searched without it: UTF-16, with line numbers as for UTF-8, and UTF-8", async () => {
+  const root = await realpath(await tempDir());
+  const text = "first line\r\npassword = hunter2\r\nlast line\r\n";
+  await writeTree(root, {
+    "le.txt": Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]),
+    "be.txt": Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(text, "utf16le").swap16()]),
+    // As Visual Studio saves C# files, and Excel CSV exports.
+    "utf8.txt": Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text)]),
+    // NUL bytes and no byte-order mark: binary.
+    "no-mark.txt": Buffer.from(text, "utf16le"),
+  });
+
+  assert.equal(resultText(await grep(join(root, "le.txt"), root, { pattern: "password", maxResults: 10 })), "le.txt:2:password = hunter2");
+  assert.equal(resultText(await grep(join(root, "be.txt"), root, { pattern: "password", maxResults: 10 })), "be.txt:2:password = hunter2");
+  assert.equal(
+    resultText(await grep(root, root, { pattern: "hunter2$", maxResults: 10 })),
+    "[Not searched: 1 binary file.]\n\nbe.txt:2:password = hunter2\nle.txt:2:password = hunter2\nutf8.txt:2:password = hunter2",
+  );
+  // The mark is not part of the first line: ^ matches there, and the line is shown without it.
+  assert.equal(
+    resultText(await grep(root, root, { pattern: "^first", filesOnly: true, maxResults: 10 })),
+    "[Not searched: 1 binary file.]\n\nbe.txt\nle.txt\nutf8.txt",
+  );
+  assert.equal(resultText(await grep(join(root, "utf8.txt"), root, { pattern: "^first", maxResults: 10 })), "utf8.txt:1:first line");
+});
+
+test("a final newline adds no empty line past the end of the file", async () => {
+  const root = await realpath(await tempDir());
+  await writeTree(root, { "blank.txt": "a\n\nb\n", "crlf.txt": "a\r\n\r\nb\r\n", "open.txt": "a\n\nb", "empty.txt": "" });
+
+  assert.equal(resultText(await grep(join(root, "blank.txt"), root, { pattern: "^$", maxResults: 10 })), "blank.txt:2:");
+  assert.equal(resultText(await grep(join(root, "blank.txt"), root, { pattern: "^\\s*$", maxResults: 10 })), "blank.txt:2:");
+  assert.equal(resultText(await grep(root, root, { pattern: "^$", maxResults: 10 })), "blank.txt:2:\ncrlf.txt:2:\nopen.txt:2:");
+});
+
+test("a long matching line is shown as its first 500 characters, never half a character", async () => {
+  const root = await realpath(await tempDir());
+  await writeTree(root, { "min.js": `${"a".repeat(499)}😀needle\n` });
+
+  assert.equal(resultText(await grep(root, root, { pattern: "needle", maxResults: 10 })), `min.js:1:${"a".repeat(499)}…`);
+});
+
+test("grep and glob results fit in one client result, with the notes first", async () => {
+  const root = await realpath(await tempDir());
+  // 1001 matching lines of 600 characters, each shown as a 500-character preview: about 515,000 characters in all.
+  const wide = "match ".repeat(100);
+  await writeTree(root, { "wide.txt": `${wide}\n`.repeat(1001), "zh.txt": `${"中文".repeat(250)}\n`.repeat(500) });
+
+  const lines = resultText(await grep(join(root, "wide.txt"), root, { pattern: "match", maxResults: 1000 }));
+  const [stopped, cut, gap, ...shown] = lines.split("\n");
+
+  assert.ok(lines.length <= MAX_RESULT_CHARS && Buffer.byteLength(lines) <= MAX_BYTES, `${lines.length} characters`);
+  assert.equal(stopped, "[Stopped after 1000 results. Narrow the search with path, glob or a more specific pattern.]");
+  assert.equal(
+    cut,
+    `[Output cut to fit the size limit (45,000 characters or 50KB): showing ${shown.length} of 1000 matching lines. Narrow the search to see the rest.]`,
+  );
+  assert.equal(gap, "");
+  assert.ok(shown.length > 50, `only ${shown.length} lines shown`);
+  shown.forEach((line, i) => assert.equal(line, `wide.txt:${i + 1}:${wide.slice(0, 500)}…`));
+
+  // Text of three bytes a character reaches the byte limit first.
+  const chinese = resultText(await grep(join(root, "zh.txt"), root, { pattern: "中", maxResults: 1000 }));
+  const [chineseCut, , ...chineseShown] = chinese.split("\n");
+
+  assert.ok(Buffer.byteLength(chinese) <= MAX_BYTES, `${Buffer.byteLength(chinese)} bytes`);
+  assert.match(chineseCut!, new RegExp(`^\\[Output cut to fit the size limit .*: showing ${chineseShown.length} of 500 matching lines\\.`));
+  assert.ok(chinese.length < MAX_RESULT_CHARS / 2, `${chinese.length} characters`);
+
+  // Results that fit are left whole.
+  assert.equal(resultText(await grep(join(root, "wide.txt"), root, { pattern: "match", filesOnly: true, maxResults: 1000 })), "wide.txt");
+
+  // 2000 paths of 130 characters: about 262,000 characters.
+  const many = await realpath(await tempDir());
+  const folder = "d".repeat(60);
+  const name = (i: number) => `${folder}/${String(i).padStart(4, "0")}-${"f".repeat(60)}.txt`;
+  await writeTree(many, Object.fromEntries(Array.from({ length: 2000 }, (_, i) => [name(i), ""])));
+
+  const paths = resultText(await glob(many, many, "*.txt", 2000));
+  const [showing, blank, ...listed] = paths.split("\n");
+
+  assert.ok(paths.length <= MAX_RESULT_CHARS && Buffer.byteLength(paths) <= MAX_BYTES, `${paths.length} characters`);
+  assert.equal(
+    showing,
+    `[Showing ${listed.length} of 2000 files, cut to fit the size limit (45,000 characters or 50KB). Use a more specific pattern or path.]`,
+  );
+  assert.equal(blank, "");
+  assert.ok(listed.length > 50, `only ${listed.length} paths shown`);
+  listed.forEach((path, i) => assert.equal(path, name(i)));
 });

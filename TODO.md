@@ -24,11 +24,11 @@
 
 ## 中止运行中的 bash
 
-给运行中的 bash 加一个"中止"按钮。复用现有的取消逻辑（AbortSignal 触发后杀掉整个进程组），POST 请求时校验 Origin。
+给运行中的 bash 加一个"中止"按钮。复用现有的取消逻辑（AbortSignal 触发后停掉整个进程组），POST 请求时校验 Origin。
 
 实现时注意：
 
-- 杀进程的部分已经有了：`runCommand`（`src/tools/shell.ts`）收到 abort 后，会用 `killTree` 杀掉整个进程组。目前传进去的只有客户端取消用的 `extra.signal`（`src/mcp.ts`）。
+- 停进程的部分已经有了：`runCommand`（`src/tools/shell.ts`）收到 abort 后，用 `stopGroup` 先对整个进程组发 SIGTERM，3 秒后还有进程就发 SIGKILL。目前传进去的只有客户端取消用的 `extra.signal`（`src/mcp.ts`）。
 - 给每次调用配一个 AbortController，交给 ActivityLog 保管。用 `AbortSignal.any()` 把它和 `extra.signal` 合并后再传给 `runCommand`。
 - 要能看出是在 B 上手动中止的：现在 `finish()` 只根据 `extra.signal.aborted` 判断是否取消。返回给 Claude 的结果也要写明这一点，免得它原样再跑一次。
 - 接口可以用 `POST /api/calls/:id/abort`（`src/webui.ts`）。现有的 `/api` 只拦截 `Sec-Fetch-Site: cross-site`，而本机其他端口上的网页算同站，拦不住。所以 POST 必须带 Origin，且要和页面自己的地址（`http://` + Host）完全一致，否则返回 403。

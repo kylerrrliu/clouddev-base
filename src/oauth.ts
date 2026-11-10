@@ -11,7 +11,7 @@ import type {
   OAuthTokenRevocationRequest,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { readJson, writeJsonPrivate } from "./config.ts";
+import { isPlainObject, readStateFile, writeJsonPrivate } from "./config.ts";
 import { escapeMarkup as escapeHtml } from "./markup.ts";
 
 export const SCOPE = "clouddev-base";
@@ -76,7 +76,9 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
   constructor(options: OwnerOAuthOptions) {
     this.options = options;
     this.file = join(options.stateDir, "oauth.json");
-    this.data = readJson<StoreData>(this.file) ?? { clients: {}, tokens: {} };
+    // A broken oauth.json (a power cut, a slip while editing) is moved aside rather than keeping the server from
+    // starting: clients only have to authorize again.
+    this.data = readStateFile(this.file, isStoreData, "已授权的客户端都要重新授权（在 A 上用 /mcp 重新认证）") ?? { clients: {}, tokens: {} };
     this.data.clients ??= {};
     this.data.tokens ??= {};
     this.onDisk = existsSync(this.file);
@@ -173,7 +175,7 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
 
     if (!ownerPassword) {
       this.reportAuthorization("no_password", client);
-      res.status(503).type("html").send(approvalPage(client, params, "服务器上没有可用的 Owner 密码。请在运行 clouddev-base 的电脑上执行 clouddev-base password，然后重试。"));
+      res.status(503).type("html").send(approvalPage(client, params, "服务器上没有可用的 Owner 密码。请在运行 clouddev-base 的电脑的终端里执行 clouddev-base password --show 查看（显示无法读取时，运行 clouddev-base password --reset 生成新密码），然后重试。"));
 
       return;
     }
@@ -327,6 +329,27 @@ export class OwnerOAuthProvider implements OAuthServerProvider {
     writeJsonPrivate(this.file, store);
     this.onDisk = true;
   }
+}
+
+/** What oauth.json must hold; anything else counts as broken. Either list may be missing. */
+function isStoreData(value: unknown): value is StoreData {
+  if (!isPlainObject(value)) return false;
+
+  const { clients = {}, tokens = {} } = value;
+
+  return isPlainObject(clients) && Object.values(clients).every(isClient) && isPlainObject(tokens) && Object.values(tokens).every(isTokenRecord);
+}
+
+function isClient(value: unknown): boolean {
+  return isPlainObject(value) && typeof value.client_id === "string" && Array.isArray(value.redirect_uris);
+}
+
+function isTokenRecord(value: unknown): boolean {
+  return isPlainObject(value)
+    && (value.kind === "access" || value.kind === "refresh")
+    && typeof value.clientId === "string"
+    && typeof value.expiresAt === "number"
+    && typeof value.resource === "string";
 }
 
 function isExpired(record: TokenRecord): boolean {

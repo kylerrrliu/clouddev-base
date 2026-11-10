@@ -3,7 +3,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
-import { isInside } from "../paths.ts";
+import { isInside, isMissing } from "../paths.ts";
 import { readIndexPaths } from "./git-index.ts";
 import { configValue, IGNORE_CASE, isIgnored, parseIgnoreFile, type IgnoreFile } from "./gitignore.ts";
 
@@ -32,7 +32,29 @@ export interface FileList {
   /** Paths relative to the listed folder, always with forward slashes. */
   files: string[];
   capped: boolean;
+  /**
+   * Folders that could not be read (permission denied and the like), relative like `files` ("" for the listed
+   * folder itself). Whatever they hold is missing from `files`, so a search should say so.
+   */
+  unreadable: string[];
 }
+
+/** A regular file and its contents, as tryReadRegularFile read it. */
+export interface RegularFile {
+  data: Buffer;
+  stats: Stats;
+}
+
+/** Why tryReadRegularFile did not read a file. */
+export type ReadFailure =
+  /** Gone: deleted, or a folder on the way replaced by a file, since it was listed. */
+  | { reason: "missing" }
+  /** A symlink (unless followed), folder, FIFO, socket or device. */
+  | { reason: "not-regular" }
+  /** Over `maxBytes`. `head` holds its first bytes when the caller asked for them, to tell what kind of file it is. */
+  | { reason: "too-large"; size: number; head?: Buffer }
+  /** There, but it could not be opened or read: permission denied, an I/O error. */
+  | { reason: "unreadable"; code: string };
 
 interface Folder {
   path: string;
@@ -77,7 +99,7 @@ interface RepoState {
  * ignore them. Nested repositories and submodules are entered and follow their
  * own rules. Outside repositories, DEFAULT_IGNORED_DIRS are skipped. Symlinks
  * are neither followed nor listed, and neither are folders, sockets, FIFOs or
- * devices.
+ * devices. Folders that cannot be read are named in `unreadable`.
  *
  * `root` itself is always listed, even when ignored: a search of
  * "node_modules/pkg" covers all of it, minding only .gitignore files inside.
@@ -102,11 +124,18 @@ export function listFiles(root: string, workspaceRoot = root, limit = MAX_LISTED
   };
 
   const files: string[] = [];
+  const unreadable: string[] = [];
   const pending: Folder[] = [startFolder(root, workspaceRoot, openRepo)];
 
   while (pending.length > 0) {
     const folder = pending.pop()!;
     const entries = readEntries(folder.path);
+
+    if (entries === undefined) {
+      unreadable.push(folder.rel);
+      continue;
+    }
+
     let state = folder.repo;
 
     // A nested repository or submodule starts over with its own rules (unless
@@ -155,7 +184,7 @@ export function listFiles(root: string, workspaceRoot = root, limit = MAX_LISTED
       } else {
         files.push(rel);
 
-        if (files.length >= limit) return { files, capped: true };
+        if (files.length >= limit) return { files, capped: true, unreadable };
       }
     }
 
@@ -163,7 +192,7 @@ export function listFiles(root: string, workspaceRoot = root, limit = MAX_LISTED
     for (let i = subfolders.length - 1; i >= 0; i--) pending.push(subfolders[i]!);
   }
 
-  return { files, capped: false };
+  return { files, capped: false, unreadable };
 }
 
 function startFolder(root: string, workspaceRoot: string, openRepo: (repoRoot: string) => Repo): Folder {
@@ -221,11 +250,14 @@ function pathParts(from: string, to: string): string[] {
   return rel.split(sep);
 }
 
-function readEntries(path: string): Dirent[] {
+/** A folder's entries in name order: none once it is gone, undefined when it cannot be read. */
+function readEntries(path: string): Dirent[] | undefined {
   try {
     return readdirSync(path, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  } catch {
-    return []; // Deleted or unreadable: skipped.
+  } catch (error) {
+    // Deleted (or replaced by a file) since its parent was listed: nothing was lost. Any other error, such as
+    // permission denied, hides files the caller should hear about.
+    return isMissing(error) ? [] : undefined;
   }
 }
 
@@ -326,38 +358,72 @@ export function globalExcludesPath(env: NodeJS.ProcessEnv = process.env): string
 
 /**
  * Read a regular file of at most `maxBytes`. Returns undefined for anything
- * else: missing, too large, a folder, FIFO or device, or (unless `follow`) a
- * symlink. Never blocks on a FIFO.
+ * else: missing, too large, unreadable, a folder, FIFO or device, or (unless
+ * `follow`) a symlink. Never blocks on a FIFO.
  */
-export function readRegularFile(path: string, maxBytes: number, follow = false): { data: Buffer; stats: Stats } | undefined {
+export function readRegularFile(path: string, maxBytes: number, follow = false): RegularFile | undefined {
+  const file = tryReadRegularFile(path, maxBytes, follow);
+
+  return "reason" in file ? undefined : file;
+}
+
+/**
+ * readRegularFile, saying why when it reads nothing. For a file over `maxBytes`, `headBytes` asks for its first
+ * bytes, read from the same open file, so they belong to the file that was found too large.
+ */
+export function tryReadRegularFile(path: string, maxBytes: number, follow = false, headBytes = 0): RegularFile | ReadFailure {
   let fd: number;
 
   try {
     fd = openSync(path, follow ? OPEN_FLAGS : OPEN_FLAGS_NOFOLLOW);
-  } catch {
-    return undefined;
+  } catch (error) {
+    return openFailure(error);
   }
 
   try {
     const stats = fstatSync(fd);
 
-    if (!stats.isFile() || stats.size > maxBytes) return undefined;
+    if (!stats.isFile()) return { reason: "not-regular" };
 
-    const data = Buffer.allocUnsafe(stats.size);
-    let length = 0;
-
-    while (length < data.length) {
-      const read = readSync(fd, data, length, data.length - length, null);
-      if (read === 0) break;
-      length += read;
+    if (stats.size > maxBytes) {
+      return headBytes > 0
+        ? { reason: "too-large", size: stats.size, head: readStart(fd, Math.min(headBytes, stats.size)) }
+        : { reason: "too-large", size: stats.size };
     }
 
-    return { data: data.subarray(0, length), stats };
-  } catch {
-    return undefined;
+    return { data: readStart(fd, stats.size), stats };
+  } catch (error) {
+    return { reason: "unreadable", code: errorCode(error) };
   } finally {
     closeSync(fd);
   }
+}
+
+/** The first `length` bytes of the open file `fd`: fewer when it has shrunk since its size was taken. */
+function readStart(fd: number, length: number): Buffer {
+  const data = Buffer.allocUnsafe(length);
+  let filled = 0;
+
+  while (filled < length) {
+    const read = readSync(fd, data, filled, length - filled, filled);
+    if (read === 0) break;
+    filled += read;
+  }
+
+  return data.subarray(0, filled);
+}
+
+function openFailure(error: unknown): ReadFailure {
+  if (isMissing(error)) return { reason: "missing" };
+
+  // O_NOFOLLOW refuses a symlink with ELOOP.
+  const code = errorCode(error);
+
+  return code === "ELOOP" ? { reason: "not-regular" } : { reason: "unreadable", code };
+}
+
+function errorCode(error: unknown): string {
+  return (error as NodeJS.ErrnoException | undefined)?.code ?? String(error);
 }
 
 /**

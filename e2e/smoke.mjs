@@ -5,7 +5,7 @@
 //   --workspace    B 上 e2e/demo-app 的副本，必须在 B 允许访问的目录里；~ 指的是 B 上的家目录
 //
 // B 的 Owner 密码：在终端里运行时会提示输入（不显示）；也可以从标准输入传进来，比如只有一台 Mac 时
-//   ~/clouddev-e2e/bin/clouddev-base password | node e2e/smoke.mjs --tunnel-port 17676
+//   ~/clouddev-e2e/bin/clouddev-base password --show | node e2e/smoke.mjs --tunnel-port 17676
 // 不打印 Owner 密码和令牌。每次运行都在 B 上注册一个叫 e2e-smoke 的客户端，它和这些调用都会出现在 B 的 WebUI 里。
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -61,7 +61,7 @@ async function ownerPassword() {
     return data.split(/\r?\n/)[0].trim();
   }
 
-  process.stdout.write("B 的 Owner 密码（在 B 上运行 clouddev-base password 查看；输入时不显示）: ");
+  process.stdout.write("B 的 Owner 密码（在 B 的终端里运行 clouddev-base password --show 查看；输入时不显示）: ");
   const stdin = process.stdin;
   stdin.setRawMode(true);
   stdin.setEncoding("utf8");
@@ -111,7 +111,7 @@ try {
   process.exit(1);
 }
 
-check(health.ok === true && health.name === "clouddev-base", "经隧道访问 B 上的 /healthz", `pid ${health.pid}（在 B 上运行 curl http://127.0.0.1:7676/healthz，pid 应该相同）`);
+check(health.ok === true && health.name === "clouddev-base", "经隧道访问 B 上的 /healthz", `pid ${health.pid}（在 B 上运行 curl --noproxy '*' http://127.0.0.1:7676/healthz，pid 应该相同）`);
 
 // 3. 不带令牌访问 /mcp 被拒绝，并指向资源元数据
 const anonymous = await fetch(mcpUrl, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });

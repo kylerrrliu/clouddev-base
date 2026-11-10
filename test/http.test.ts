@@ -508,6 +508,9 @@ test("a late cancellation for a finished request does not hit a newer request wi
     // Disconnecting still stops it.
     disconnect.abort();
     await waitFor("the command to exit after the disconnect", () => !pids.some(isRunning));
+    // The call ends only once the command's whole process group is gone (SIGTERM, then a check every 100 ms): wait
+    // for the activity log to record that, so its end does not show up in the next test's events.
+    await waitFor("the call to be recorded as finished", () => activity.snapshot().calls.every((call) => call.status !== "running"));
   } finally {
     disconnect.abort();
     killLeftovers(pids);
